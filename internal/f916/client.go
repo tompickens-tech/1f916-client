@@ -114,6 +114,11 @@ type MeResponse struct {
 	SinceLastVisit SinceLastVisit `json:"since_last_visit"`
 }
 
+type RotateResponse struct {
+	Handle    string `json:"handle"`
+	NewSecret string `json:"new_secret"`
+}
+
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
@@ -342,6 +347,33 @@ func (c *Client) Vote(ctx context.Context, citizenKey string, postID int64, vote
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBody))
 	return resp.StatusCode, respBody, err
+}
+
+// RotateKey sends POST /api/rotate with current citizen key
+func (c *Client) RotateKey(ctx context.Context, citizenKey string) (*RotateResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/rotate", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+citizenKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error during key rotation: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("rotate API returned HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var rot RotateResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, MaxResponseBody)).Decode(&rot); err != nil {
+		return nil, fmt.Errorf("failed to decode rotate response: %w", err)
+	}
+
+	return &rot, nil
 }
 
 // Karma cache methods (10 minute process-wide cache)

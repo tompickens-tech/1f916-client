@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tompickens06-tech/1f916-client/internal/f916"
 	"github.com/tompickens06-tech/1f916-client/internal/session"
@@ -58,7 +59,7 @@ func NewServer(client *f916.Client) (*Server, error) {
 		},
 	}
 
-	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose"}
+	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose", "inbox", "rotate"}
 	tmpls := make(map[string]*template.Template)
 
 	for _, page := range pages {
@@ -138,6 +139,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("POST /comment", s.handleCommentPost)
 	mux.HandleFunc("POST /vote", s.handleVotePost)
+
+	mux.HandleFunc("GET /inbox", s.handleInboxGet)
+	mux.HandleFunc("GET /rotate", s.handleRotateGet)
+	mux.HandleFunc("POST /rotate", s.handleRotatePost)
 
 	mux.HandleFunc("GET /static/", http.FileServer(http.FS(webassets.StaticFS)).ServeHTTP)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -945,7 +950,6 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 	statusCode, respBody, err := s.client.CreatePost(r.Context(), sess.CitizenKey, title, body, postURL)
 
 	if statusCode == 429 {
-		// Never trust 429: re-query /api/me?since= and report actual quota value
 		me, meErr := s.client.GetMe(r.Context(), sess.CitizenKey, 0)
 		remaining := 0
 		if meErr == nil {
@@ -1037,4 +1041,127 @@ func (s *Server) handleVotePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, redirect, http.StatusSeeOther)
+}
+
+// Stage v0.4 Handlers: Inbox & Rotation
+
+func (s *Server) handleInboxGet(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	// Always pass ?since= timestamp to avoid reset side-effects
+	sinceMs := time.Now().UnixMilli() - 86400000 // default 24h
+	me, err := s.client.GetMe(r.Context(), sess.CitizenKey, sinceMs)
+	if err != nil {
+		s.renderError(w, r, fmt.Sprintf("Failed to fetch inbox: %v", err))
+		return
+	}
+
+	utcTime, _ := FormatUTCAndRelative(sinceMs)
+
+	data := map[string]interface{}{
+		"Title":        "Inbox",
+		"ActiveNav":    "inbox",
+		"CurrentPath":  r.URL.Path,
+		"KarmaOn":      s.isKarmaOn(r),
+		"Session":      sess,
+		"Totals":       me.SinceLastVisit.Totals,
+		"LastSeenTime": utcTime,
+	}
+	s.templates["inbox"].Execute(w, data)
+}
+
+func (s *Server) handleRotateGet(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	data := map[string]interface{}{
+		"Title":       "Rotate Secret Key",
+		"CurrentPath": r.URL.Path,
+		"KarmaOn":     s.isKarmaOn(r),
+		"Session":     sess,
+		"CSRFToken":   session.GenerateRandomID(16),
+	}
+	s.templates["rotate"].Execute(w, data)
+}
+
+func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	password := r.FormValue("password")
+
+	// 1. Call POST /api/rotate on 1f916.ai
+	rotResp, err := s.client.RotateKey(r.Context(), sess.CitizenKey)
+	if err != nil {
+		s.renderRotateError(w, r, fmt.Sprintf("Key rotation failed on server: %v", err))
+		return
+	}
+
+	// 2. Re-derive keys from password + email
+	kd, err := vault.DeriveKeys(sess.Email, password)
+	if err != nil {
+		s.renderOrphanKey(w, r, rotResp.NewSecret)
+		return
+	}
+	defer kd.Zero()
+
+	// 3. Encrypt new vault blob with new secret key
+	pt := &vault.VaultPlaintext{
+		V:      1,
+		Secret: rotResp.NewSecret,
+		Handle: rotResp.Handle,
+	}
+	blobData, err := vault.EncryptVaultBlob(kd.KEK, pt)
+	if err != nil {
+		s.renderOrphanKey(w, r, rotResp.NewSecret)
+		return
+	}
+
+	// Fetch existing SHA for file
+	blobPath := "v/" + kd.Locator + ".bin"
+	meta, err := s.storeClient.GetBlobMetadata(r.Context(), sess.Repo, sess.ReadToken, blobPath)
+	existingSHA := ""
+	if err == nil && meta != nil {
+		existingSHA = meta.SHA
+	}
+
+	// 4. Upload updated vault blob to GitHub store
+	writeToken := sess.WriteToken
+	if writeToken == "" {
+		writeToken = sess.ReadToken
+	}
+
+	if err := s.storeClient.PutBlob(r.Context(), sess.Repo, writeToken, blobPath, blobData, existingSHA); err != nil {
+		// Vault PUT failed after rotation -> Render orphan key screen!
+		s.renderOrphanKey(w, r, rotResp.NewSecret)
+		return
+	}
+
+	// Rotation succeeded: update session secret key
+	sess.CitizenKey = rotResp.NewSecret
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *Server) renderRotateError(w http.ResponseWriter, r *http.Request, msg string) {
+	sess := s.getSession(r)
+	data := map[string]interface{}{
+		"Title":        "Rotate Secret Key",
+		"ErrorMessage": msg,
+		"CurrentPath":  r.URL.Path,
+		"KarmaOn":      s.isKarmaOn(r),
+		"Session":      sess,
+		"CSRFToken":    session.GenerateRandomID(16),
+	}
+	s.templates["rotate"].Execute(w, data)
 }

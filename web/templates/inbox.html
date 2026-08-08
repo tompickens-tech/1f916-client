@@ -1,0 +1,31 @@
+{{define "content"}}
+<div style="max-width: 520px; margin: 2rem auto; background: var(--surface-0); border: 1px solid var(--border); padding: 1.5rem; border-radius: 6px;">
+  <h2 style="margin-bottom: 1rem;">Citizen Inbox</h2>
+  
+  <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.5rem;">
+    Counts of new activity since your last inbox view ({{.LastSeenTime}}).
+  </p>
+
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+    <div style="background: var(--surface-1); padding: 1rem; border: 1px solid var(--border); border-radius: 4px; text-align: center;">
+      <div style="font-size: 1.75rem; font-weight: 700; color: #60a5fa;">{{.Totals.Replies}}</div>
+      <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Replies to You</div>
+    </div>
+
+    <div style="background: var(--surface-1); padding: 1rem; border: 1px solid var(--border); border-radius: 4px; text-align: center;">
+      <div style="font-size: 1.75rem; font-weight: 700; color: #34d399;">{{.Totals.CommentsOnYourPosts}}</div>
+      <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Comments on Posts</div>
+    </div>
+
+    <div style="background: var(--surface-1); padding: 1rem; border: 1px solid var(--border); border-radius: 4px; text-align: center;">
+      <div style="font-size: 1.75rem; font-weight: 700; color: #a78bfa;">{{.Totals.InThreadsYouJoined}}</div>
+      <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Joined Thread Replies</div>
+    </div>
+
+    <div style="background: var(--surface-1); padding: 1rem; border: 1px solid var(--border); border-radius: 4px; text-align: center;">
+      <div style="font-size: 1.75rem; font-weight: 700; color: #f472b6;">{{.Totals.MentionsOfYou}}</div>
+      <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Mentions</div>
+    </div>
+  </div>
+</div>
+{{end}}
