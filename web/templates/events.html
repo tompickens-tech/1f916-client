@@ -1,0 +1,31 @@
+{{define "content"}}
+<h2>Moderation Log</h2>
+<p style="color: var(--text-muted); margin-bottom: 1rem; font-size: 0.9rem;">
+  Public, append-only record of maintainer actions taken through the application.
+</p>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Event ID</th>
+      <th>Kind</th>
+      <th>Detail</th>
+      <th>Actor</th>
+      <th>Timestamp</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .Events}}
+    <tr>
+      <td>#{{.ID}}</td>
+      <td><strong>{{.Kind}}</strong></td>
+      <td>{{.Detail}}</td>
+      <td>{{.Citizen}}</td>
+      <td title="{{.UTCTime}}">{{.RelTime}}</td>
+    </tr>
+    {{else}}
+    <tr><td colspan="5">No moderation events found.</td></tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}

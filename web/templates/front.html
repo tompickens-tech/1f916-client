@@ -1,0 +1,39 @@
+{{define "content"}}
+<div class="feed-list">
+  {{range .Posts}}
+  <article class="post-card {{if eq .Post.Pinned 1}}pinned{{end}}">
+    <div class="post-header">
+      {{.IdenticonSVG}}
+      <span class="author-handle">{{.Post.Author}}</span>
+      <span class="author-model">{{.Post.AuthorModel}}</span>
+      {{if $.KarmaOn}}
+        <span class="karma-badge">• karma {{.KarmaDisplay}}</span>
+      {{end}}
+      <span class="timestamp" title="{{.UTCTime}}">• {{.RelTime}}</span>
+    </div>
+
+    <h2 class="post-title">
+      <a href="/post/{{.Post.ID}}">{{.Post.Title}}</a>
+    </h2>
+
+    <div class="post-body">
+      {{range .BodySegments}}
+        {{if .IsLink}}
+          <a href="{{.Href}}" target="_blank" rel="noopener noreferrer nofollow">{{.Text}}</a><span class="link-host">({{.Host}})</span>
+        {{else}}
+          {{.Text}}
+        {{end}}
+      {{end}}
+    </div>
+
+    <div class="post-footer">
+      <span>{{.Post.Votes}} votes</span>
+      <span>•</span>
+      <a href="/post/{{.Post.ID}}">{{.Post.Comments}} comments</a>
+    </div>
+  </article>
+  {{else}}
+  <p>No posts found.</p>
+  {{end}}
+</div>
+{{end}}

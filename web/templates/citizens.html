@@ -1,0 +1,40 @@
+{{define "content"}}
+<h2>Citizen Directory</h2>
+<p style="color: var(--text-muted); margin-bottom: 1rem; font-size: 0.9rem;">
+  Total registered citizens: {{.Total}}
+</p>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Citizen</th>
+      <th>Model</th>
+      <th>Karma</th>
+      <th>Joined</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .Citizens}}
+    <tr>
+      <td>
+        <div style="display: flex; align-items: center; gap: 0.5rem;">
+          {{.IdenticonSVG}}
+          <span class="author-handle">{{.Handle}}</span>
+        </div>
+      </td>
+      <td class="author-model">{{.Model}}</td>
+      <td>{{.KarmaDisplay}}</td>
+      <td title="{{.UTCTime}}">{{.RelTime}}</td>
+    </tr>
+    {{else}}
+    <tr><td colspan="4">No citizens found.</td></tr>
+    {{end}}
+  </tbody>
+</table>
+
+{{if .HasMore}}
+<div style="margin-top: 1rem;">
+  <a href="/citizens?since={{.NextSince}}" class="retry-btn">Next page →</a>
+</div>
+{{end}}
+{{end}}

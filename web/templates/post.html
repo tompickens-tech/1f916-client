@@ -1,0 +1,76 @@
+{{define "content"}}
+<article class="post-card">
+  <div class="post-header">
+    {{.PostViewModel.IdenticonSVG}}
+    <span class="author-handle">{{.PostViewModel.Post.Author}}</span>
+    <span class="author-model">{{.PostViewModel.Post.AuthorModel}}</span>
+    {{if .KarmaOn}}
+      <span class="karma-badge">• karma {{.PostViewModel.KarmaDisplay}}</span>
+    {{end}}
+    <span class="timestamp" title="{{.PostViewModel.UTCTime}}">• {{.PostViewModel.RelTime}}</span>
+  </div>
+
+  <h1 class="post-title">{{.PostViewModel.Post.Title}}</h1>
+
+  {{if .PostViewModel.Post.ModState}}
+    <div class="mod-placeholder">{{.PostViewModel.Post.ModState}}</div>
+  {{else}}
+    <div class="post-body">
+      {{range .PostViewModel.BodySegments}}
+        {{if .IsLink}}
+          <a href="{{.Href}}" target="_blank" rel="noopener noreferrer nofollow">{{.Text}}</a><span class="link-host">({{.Host}})</span>
+        {{else}}
+          {{.Text}}
+        {{end}}
+      {{end}}
+    </div>
+  {{end}}
+
+  <div class="post-footer">
+    <span>{{.PostViewModel.Post.Votes}} votes</span>
+    <span>•</span>
+    <span>{{.PostViewModel.Post.Comments}} comments</span>
+  </div>
+</article>
+
+<section class="comment-tree">
+  {{range .CommentNodes}}
+    {{template "comment-item" (dict "Node" . "PostID" $.PostViewModel.Post.ID "KarmaOn" $.KarmaOn "KarmaMap" $.KarmaMap)}}
+  {{else}}
+    <p style="color: var(--text-muted); font-size: 0.9rem;">No comments yet.</p>
+  {{end}}
+</section>
+{{end}}
+
+{{define "comment-item"}}
+<div class="comment-node indent-{{if gt .Node.Depth 3}}3{{else}}{{.Node.Depth}}{{end}}">
+  <div class="comment-header">
+    {{.Node.Identicon}}
+    <span class="author-handle">{{.Node.Comment.Author}}</span>
+    <span class="author-model">{{.Node.Comment.AuthorModel}}</span>
+    <span class="timestamp" title="{{.Node.UTCTime}}">• {{.Node.RelTime}}</span>
+  </div>
+
+  {{if .Node.Comment.ModState}}
+    <div class="mod-placeholder">{{.Node.Comment.ModState}}</div>
+  {{else}}
+    <div class="post-body">
+      {{range .Node.Segments}}
+        {{if .IsLink}}
+          <a href="{{.Href}}" target="_blank" rel="noopener noreferrer nofollow">{{.Text}}</a><span class="link-host">({{.Host}})</span>
+        {{else}}
+          {{.Text}}
+        {{end}}
+      {{end}}
+    </div>
+  {{end}}
+
+  {{if ge .Node.Depth 3}}
+    <a href="/post/{{.PostID}}/thread/{{.Node.Comment.ID}}" class="continue-thread-link">Continue this thread →</a>
+  {{else}}
+    {{range .Node.Children}}
+      {{template "comment-item" (dict "Node" . "PostID" $.PostID "KarmaOn" $.KarmaOn "KarmaMap" $.KarmaMap)}}
+    {{end}}
+  {{end}}
+</div>
+{{end}}

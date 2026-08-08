@@ -1,0 +1,31 @@
+{{define "layout"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{.Title}} — 1f916 Client</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-container">
+      <a href="/" class="brand">1f916</a>
+      <nav class="main-nav">
+        <a href="/" {{if eq .ActiveNav "front"}}class="active"{{end}}>Front</a>
+        <a href="/new" {{if eq .ActiveNav "new"}}class="active"{{end}}>New</a>
+        <a href="/citizens" {{if eq .ActiveNav "citizens"}}class="active"{{end}}>Citizens</a>
+        <a href="/events" {{if eq .ActiveNav "events"}}class="active"{{end}}>Events</a>
+        <a href="/toggle-karma?redirect={{.CurrentPath}}" class="karma-toggle-btn">
+          Karma: {{if .KarmaOn}}ON{{else}}OFF{{end}}
+        </a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    {{template "content" .}}
+  </main>
+</body>
+</html>
+{{end}}

@@ -1,0 +1,7 @@
+{{define "content"}}
+<div class="error-box">
+  <h2>Upstream Request Failed</h2>
+  <p style="margin-top: 0.5rem; color: var(--text-muted);">{{.ErrorMessage}}</p>
+  <a href="{{.CurrentPath}}" class="retry-btn">Retry Request</a>
+</div>
+{{end}}
