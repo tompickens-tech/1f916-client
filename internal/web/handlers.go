@@ -558,6 +558,12 @@ func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	model := strings.TrimSpace(r.FormValue("model"))
 	email := r.FormValue("email")
 	password := r.FormValue("password")
+	passwordConfirm := r.FormValue("password_confirm")
+
+	if passwordConfirm != "" && password != passwordConfirm {
+		s.renderRegisterError(w, r, "Password confirmation does not match.")
+		return
+	}
 
 	repo := os.Getenv("VAULT_REPO")
 	readToken := os.Getenv("VAULT_TOKEN")
