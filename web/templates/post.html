@@ -27,15 +27,40 @@
   {{end}}
 
   <div class="post-footer">
+    {{if .Session}}
+      <form action="/vote" method="POST" style="display: inline-flex; align-items: center; gap: 0.25rem;">
+        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+        <input type="hidden" name="post_id" value="{{.PostViewModel.Post.ID}}">
+        <input type="hidden" name="vote" value="1">
+        <button type="submit" style="background: none; border: 1px solid var(--border); color: var(--text-main); padding: 0.15rem 0.4rem; border-radius: 4px; cursor: pointer; font-size: 0.8rem;">▲ Vote</button>
+      </form>
+    {{end}}
     <span>{{.PostViewModel.Post.Votes}} votes</span>
     <span>•</span>
     <span>{{.PostViewModel.Post.Comments}} comments</span>
   </div>
 </article>
 
+{{if .Session}}
+  <!-- Comment form for logged-in users -->
+  <div style="background: var(--surface-0); border: 1px solid var(--border); padding: 1.25rem; border-radius: 6px; margin: 1.5rem 0;">
+    <h3 style="font-size: 0.95rem; margin-bottom: 0.5rem;">Add a Comment</h3>
+    <form action="/comment" method="POST" style="display: flex; flex-direction: column; gap: 0.75rem;">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <input type="hidden" name="post_id" value="{{.PostViewModel.Post.ID}}">
+      <textarea name="body" required maxlength="8000" rows="4" placeholder="Write your comment..." style="width: 100%; padding: 0.5rem; background: var(--surface-1); border: 1px solid var(--border); color: var(--text-main); border-radius: 4px; font-family: inherit;"></textarea>
+      <button type="submit" class="retry-btn" style="align-self: flex-start;">Submit Comment</button>
+    </form>
+  </div>
+{{else}}
+  <div style="background: var(--surface-0); border: 1px solid var(--border); padding: 1rem; border-radius: 6px; margin: 1.5rem 0; font-size: 0.9rem; color: var(--text-muted);">
+    <a href="/login" style="color: #60a5fa; font-weight: 600;">Log in</a> or <a href="/register" style="color: #60a5fa; font-weight: 600;">Register</a> to comment or vote.
+  </div>
+{{end}}
+
 <section class="comment-tree">
   {{range .CommentNodes}}
-    {{template "comment-item" (dict "Node" . "PostID" $.PostViewModel.Post.ID "KarmaOn" $.KarmaOn "KarmaMap" $.KarmaMap)}}
+    {{template "comment-item" (dict "Node" . "PostID" $.PostViewModel.Post.ID "KarmaOn" $.KarmaOn "KarmaMap" $.KarmaMap "Session" $.Session "CSRFToken" $.CSRFToken)}}
   {{else}}
     <p style="color: var(--text-muted); font-size: 0.9rem;">No comments yet.</p>
   {{end}}
@@ -65,11 +90,25 @@
     </div>
   {{end}}
 
+  {{if and .Session (lt .Node.Depth 6)}}
+    <!-- Reply form for logged-in users under depth 6 -->
+    <details style="margin-top: 0.5rem;">
+      <summary style="font-size: 0.8rem; color: var(--text-muted); cursor: pointer;">Reply</summary>
+      <form action="/comment" method="POST" style="margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.5rem;">
+        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+        <input type="hidden" name="post_id" value="{{$.PostID}}">
+        <input type="hidden" name="parent_id" value="{{.Node.Comment.ID}}">
+        <textarea name="body" required maxlength="8000" rows="3" placeholder="Reply to {{.Node.Comment.Author}}..." style="width: 100%; padding: 0.4rem; background: var(--surface-1); border: 1px solid var(--border); color: var(--text-main); border-radius: 4px; font-family: inherit; font-size: 0.85rem;"></textarea>
+        <button type="submit" class="retry-btn" style="align-self: flex-start; padding: 0.3rem 0.6rem; font-size: 0.8rem;">Submit Reply</button>
+      </form>
+    </details>
+  {{end}}
+
   {{if ge .Node.Depth 3}}
     <a href="/post/{{.PostID}}/thread/{{.Node.Comment.ID}}" class="continue-thread-link">Continue this thread →</a>
   {{else}}
     {{range .Node.Children}}
-      {{template "comment-item" (dict "Node" . "PostID" $.PostID "KarmaOn" $.KarmaOn "KarmaMap" $.KarmaMap)}}
+      {{template "comment-item" (dict "Node" . "PostID" $.PostID "KarmaOn" $.KarmaOn "KarmaMap" $.KarmaMap "Session" $.Session "CSRFToken" $.CSRFToken)}}
     {{end}}
   {{end}}
 </div>

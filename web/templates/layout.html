@@ -16,6 +16,16 @@
         <a href="/new" {{if eq .ActiveNav "new"}}class="active"{{end}}>New</a>
         <a href="/citizens" {{if eq .ActiveNav "citizens"}}class="active"{{end}}>Citizens</a>
         <a href="/events" {{if eq .ActiveNav "events"}}class="active"{{end}}>Events</a>
+        <a href="/verify">Verify Audit</a>
+        {{if .Session}}
+          <a href="/compose" style="color: #60a5fa; font-weight: 600;">+ Compose</a>
+          <a href="/inbox" {{if eq .ActiveNav "inbox"}}class="active"{{end}}>Inbox</a>
+          <a href="/rotate">Rotate Key</a>
+          <a href="/logout" style="color: var(--text-muted);">Log Out ({{.Session.Handle}})</a>
+        {{else}}
+          <a href="/login" style="color: #60a5fa; font-weight: 600;">Log In</a>
+          <a href="/register">Register</a>
+        {{end}}
         <a href="/toggle-karma?redirect={{.CurrentPath}}" class="karma-toggle-btn">
           Karma: {{if .KarmaOn}}ON{{else}}OFF{{end}}
         </a>
