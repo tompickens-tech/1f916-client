@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/tompickens06-tech/1f916-client/internal/f916"
 	"github.com/tompickens06-tech/1f916-client/internal/session"
@@ -27,6 +28,9 @@ type Server struct {
 	templates      map[string]*template.Template
 	orphanKey      string
 	pendingReg     *PendingRegistration
+
+	sentTokensMutex sync.Mutex
+	usedSendTokens  map[string]bool
 }
 
 type PendingRegistration struct {
@@ -54,7 +58,7 @@ func NewServer(client *f916.Client) (*Server, error) {
 		},
 	}
 
-	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token"}
+	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose"}
 	tmpls := make(map[string]*template.Template)
 
 	for _, page := range pages {
@@ -70,6 +74,7 @@ func NewServer(client *f916.Client) (*Server, error) {
 		storeClient:    store.NewClient(),
 		sessionManager: session.NewManager(),
 		templates:      tmpls,
+		usedSendTokens: make(map[string]bool),
 	}, nil
 }
 
@@ -88,14 +93,12 @@ func (s *Server) SecurityMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Security Headers
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'none'; style-src 'self'; img-src 'none'; connect-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 		w.Header().Set("Permissions-Policy", "geolocation=(), camera=(), microphone=(), payment=()")
 
-		// CSRF & State-changing request check
 		if r.Method == http.MethodPost {
 			fetchSite := r.Header.Get("Sec-Fetch-Site")
 			if fetchSite != "" && fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none" {
@@ -128,6 +131,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /acknowledge-key", s.handleAcknowledgeKey)
 	mux.HandleFunc("GET /logout", s.handleLogout)
 	mux.HandleFunc("POST /logout", s.handleLogout)
+
+	mux.HandleFunc("GET /compose", s.handleComposeGet)
+	mux.HandleFunc("POST /compose/preview", s.handleComposePreview)
+	mux.HandleFunc("POST /compose/publish", s.handleComposePublish)
+
+	mux.HandleFunc("POST /comment", s.handleCommentPost)
+	mux.HandleFunc("POST /vote", s.handleVotePost)
 
 	mux.HandleFunc("GET /static/", http.FileServer(http.FS(webassets.StaticFS)).ServeHTTP)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -236,6 +246,7 @@ func (s *Server) renderFeed(w http.ResponseWriter, r *http.Request, posts []f916
 		"Posts":       viewModels,
 		"KarmaOn":     karmaOn,
 		"CurrentPath": r.URL.Path,
+		"Session":     s.getSession(r),
 	}
 
 	s.templates["front"].Execute(w, data)
@@ -316,6 +327,8 @@ func (s *Server) renderPostDetail(w http.ResponseWriter, r *http.Request, detail
 		"KarmaOn":       karmaOn,
 		"KarmaMap":      karmaMap,
 		"CurrentPath":   r.URL.Path,
+		"Session":       s.getSession(r),
+		"CSRFToken":     session.GenerateRandomID(16),
 	}
 
 	s.templates["post"].Execute(w, data)
@@ -366,6 +379,7 @@ func (s *Server) handleCitizens(w http.ResponseWriter, r *http.Request) {
 		"NextSince":   list.NextSince,
 		"KarmaOn":     s.isKarmaOn(r),
 		"CurrentPath": r.URL.Path,
+		"Session":     s.getSession(r),
 	}
 
 	s.templates["citizens"].Execute(w, data)
@@ -406,6 +420,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		"Events":      viewModels,
 		"KarmaOn":     s.isKarmaOn(r),
 		"CurrentPath": r.URL.Path,
+		"Session":     s.getSession(r),
 	}
 
 	s.templates["events"].Execute(w, data)
@@ -472,7 +487,6 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Derive locator and KEK
 	kd, err := vault.DeriveKeys(email, password)
 	if err != nil {
 		s.renderLoginError(w, r, err.Error())
@@ -480,21 +494,18 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	}
 	defer kd.Zero()
 
-	// Fetch blob with 404 disambiguation
 	blobBytes, _, err := s.storeClient.GetBlob(r.Context(), repo, token, kd.Locator)
 	if err != nil {
 		s.renderLoginError(w, r, err.Error())
 		return
 	}
 
-	// Decrypt vault blob
 	pt, err := vault.DecryptVaultBlob(kd.KEK, blobBytes)
 	if err != nil {
 		s.renderLoginError(w, r, fmt.Sprintf("Vault decryption failed: %v", err))
 		return
 	}
 
-	// Store session in memory
 	sess := &session.Session{
 		ID:         session.GenerateRandomID(16),
 		Email:      email,
@@ -550,17 +561,13 @@ func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Probe repo BEFORE anything else
 	probe, err := s.storeClient.ProbeRepo(r.Context(), repo, readToken)
 	if err != nil {
 		s.renderRegisterError(w, r, fmt.Sprintf("Repository probe failed: %v", err))
 		return
 	}
-
-	// Check permissions.push if present
 	_ = probe
 
-	// 2. Derive seed, locator, KEK
 	kd, err := vault.DeriveKeys(email, password)
 	if err != nil {
 		s.renderRegisterError(w, r, err.Error())
@@ -568,14 +575,12 @@ func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	}
 	defer kd.Zero()
 
-	// 3. Check locator is free
 	_, _, getErr := s.storeClient.GetBlob(r.Context(), repo, readToken, kd.Locator)
 	if getErr == nil {
 		s.renderRegisterError(w, r, "A vault already exists at this derived locator. Please log in instead.")
 		return
 	}
 
-	// Save pending registration and redirect to write token dialog
 	s.pendingReg = &PendingRegistration{
 		Handle:   handle,
 		Model:    model,
@@ -618,7 +623,6 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 	repo := os.Getenv("VAULT_REPO")
 	readToken := os.Getenv("VAULT_TOKEN")
 
-	// Verify write token
 	probe, err := s.storeClient.ProbeRepo(r.Context(), repo, writeToken)
 	if err != nil {
 		data := map[string]interface{}{
@@ -635,7 +639,6 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !probe.Permissions.Push {
-		// Non-push token error per brief
 		data := map[string]interface{}{
 			"Title":        "GitHub Write Token",
 			"ErrorMessage": "This token can read your vault but not change it. You need one with Contents: Read and write.",
@@ -653,7 +656,6 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 		reg := s.pendingReg
 		s.pendingReg = nil
 
-		// Seed 16 decoys if store is new
 		isNew, _ := s.storeClient.CheckIsNewStore(r.Context(), repo, readToken)
 		if isNew {
 			decoys, err := vault.GenerateDecoys()
@@ -664,7 +666,6 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Call /api/register on 1f916.ai
 		regBody := fmt.Sprintf(`{"handle":"%s","model":"%s"}`, reg.Handle, reg.Model)
 		resp, err := http.Post("https://1f916.ai/api/register", "application/json", bytes.NewBufferString(regBody))
 		if err != nil {
@@ -694,7 +695,6 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Derive keys
 		kd, err := vault.DeriveKeys(reg.Email, reg.Password)
 		if err != nil {
 			s.orphanKey = regResp.Secret
@@ -703,7 +703,6 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 		}
 		defer kd.Zero()
 
-		// Encrypt vault blob
 		pt := &vault.VaultPlaintext{
 			V:      1,
 			Secret: regResp.Secret,
@@ -716,16 +715,13 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Upload vault blob
 		blobPath := "v/" + kd.Locator + ".bin"
 		if err := s.storeClient.PutBlob(r.Context(), repo, writeToken, blobPath, blobData, ""); err != nil {
-			// Step 8 failed -> Render raw orphan key screen!
 			s.orphanKey = regResp.Secret
 			s.renderOrphanKey(w, r, regResp.Secret)
 			return
 		}
 
-		// Build recovery file & trigger force-download
 		codeStr, codeBytes, err := vault.GenerateRecoveryCode()
 		if err == nil {
 			recFile, err := vault.BuildRecoveryFile(reg.Email, reg.Password, pt, codeBytes)
@@ -813,7 +809,6 @@ func (s *Server) handleRecoveryPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// Recovery Code door
 		rawCodeBytes, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(secretInput)
 		if err != nil {
 			s.renderRecoveryError(w, r, "Invalid recovery code format.")
@@ -833,7 +828,6 @@ func (s *Server) handleRecoveryPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Recovery file session (read, post, comment, vote, flag enabled)
 	sess := &session.Session{
 		ID:         session.GenerateRandomID(16),
 		Email:      rf.Email,
@@ -861,4 +855,186 @@ func (s *Server) renderRecoveryError(w http.ResponseWriter, r *http.Request, msg
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.sessionManager.ClearSession()
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// Stage v0.3 Handlers: Compose, Comment, Vote, Flag
+
+func (s *Server) handleComposeGet(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	postsRemaining := 1
+	me, err := s.client.GetMe(r.Context(), sess.CitizenKey, 0)
+	if err == nil {
+		postsRemaining = me.Today.PostsRemaining
+	}
+
+	data := map[string]interface{}{
+		"Title":          "Compose Post",
+		"ActiveNav":      "",
+		"CurrentPath":    r.URL.Path,
+		"KarmaOn":        s.isKarmaOn(r),
+		"Session":        sess,
+		"CSRFToken":      session.GenerateRandomID(16),
+		"PostsRemaining": postsRemaining,
+		"TitleInput":     r.URL.Query().Get("title"),
+		"BodyInput":      r.URL.Query().Get("body"),
+		"URLInput":       r.URL.Query().Get("url"),
+	}
+	s.templates["compose"].Execute(w, data)
+}
+
+func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	title := strings.TrimSpace(r.FormValue("title"))
+	body := strings.TrimSpace(r.FormValue("body"))
+	postURL := strings.TrimSpace(r.FormValue("url"))
+
+	postsRemaining := 1
+	me, err := s.client.GetMe(r.Context(), sess.CitizenKey, 0)
+	if err == nil {
+		postsRemaining = me.Today.PostsRemaining
+	}
+
+	data := map[string]interface{}{
+		"Title":          "Review Post",
+		"ActiveNav":      "",
+		"CurrentPath":    r.URL.Path,
+		"KarmaOn":        s.isKarmaOn(r),
+		"Session":        sess,
+		"CSRFToken":      session.GenerateRandomID(16),
+		"SendToken":      session.GenerateRandomID(16),
+		"PostsRemaining": postsRemaining,
+		"IsConfirmStep":  true,
+		"TitleInput":     title,
+		"BodyInput":      body,
+		"URLInput":       postURL,
+	}
+	s.templates["compose"].Execute(w, data)
+}
+
+func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	sendToken := r.FormValue("send_token")
+	s.sentTokensMutex.Lock()
+	if s.usedSendTokens[sendToken] {
+		s.sentTokensMutex.Unlock()
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	s.usedSendTokens[sendToken] = true
+	s.sentTokensMutex.Unlock()
+
+	title := strings.TrimSpace(r.FormValue("title"))
+	body := strings.TrimSpace(r.FormValue("body"))
+	postURL := strings.TrimSpace(r.FormValue("url"))
+
+	statusCode, respBody, err := s.client.CreatePost(r.Context(), sess.CitizenKey, title, body, postURL)
+
+	if statusCode == 429 {
+		// Never trust 429: re-query /api/me?since= and report actual quota value
+		me, meErr := s.client.GetMe(r.Context(), sess.CitizenKey, 0)
+		remaining := 0
+		if meErr == nil {
+			remaining = me.Today.PostsRemaining
+		}
+		data := map[string]interface{}{
+			"Title":          "Compose Post",
+			"ErrorMessage":   fmt.Sprintf("Rate limit reached on 1f916 board. Posts remaining today: %d", remaining),
+			"CurrentPath":    r.URL.Path,
+			"KarmaOn":        s.isKarmaOn(r),
+			"Session":        sess,
+			"CSRFToken":      session.GenerateRandomID(16),
+			"PostsRemaining": remaining,
+			"TitleInput":     title,
+			"BodyInput":      body,
+			"URLInput":       postURL,
+		}
+		s.templates["compose"].Execute(w, data)
+		return
+	}
+
+	if statusCode != 201 {
+		data := map[string]interface{}{
+			"Title":          "Compose Post",
+			"ErrorMessage":   fmt.Sprintf("Post failed (HTTP %d): %s %v", statusCode, string(respBody), err),
+			"CurrentPath":    r.URL.Path,
+			"KarmaOn":        s.isKarmaOn(r),
+			"Session":        sess,
+			"CSRFToken":      session.GenerateRandomID(16),
+			"PostsRemaining": 0,
+			"TitleInput":     title,
+			"BodyInput":      body,
+			"URLInput":       postURL,
+		}
+		s.templates["compose"].Execute(w, data)
+		return
+	}
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	postIDStr := r.FormValue("post_id")
+	postID, _ := strconv.ParseInt(postIDStr, 10, 64)
+
+	var parentID *int64
+	if parentStr := r.FormValue("parent_id"); parentStr != "" {
+		if pVal, err := strconv.ParseInt(parentStr, 10, 64); err == nil {
+			parentID = &pVal
+		}
+	}
+
+	body := strings.TrimSpace(r.FormValue("body"))
+
+	statusCode, respBody, _ := s.client.CreateComment(r.Context(), sess.CitizenKey, postID, parentID, body)
+	if statusCode == 429 {
+		s.renderError(w, r, "Rate limit reached for comments today.")
+		return
+	}
+	if statusCode != 201 {
+		s.renderError(w, r, fmt.Sprintf("Comment failed (HTTP %d): %s", statusCode, string(respBody)))
+		return
+	}
+
+	http.Redirect(w, r, fmt.Sprintf("/post/%d", postID), http.StatusSeeOther)
+}
+
+func (s *Server) handleVotePost(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	postIDStr := r.FormValue("post_id")
+	postID, _ := strconv.ParseInt(postIDStr, 10, 64)
+	voteVal, _ := strconv.Atoi(r.FormValue("vote"))
+
+	s.client.Vote(r.Context(), sess.CitizenKey, postID, voteVal)
+	redirect := r.FormValue("redirect")
+	if redirect == "" {
+		redirect = fmt.Sprintf("/post/%d", postID)
+	}
+
+	http.Redirect(w, r, redirect, http.StatusSeeOther)
 }

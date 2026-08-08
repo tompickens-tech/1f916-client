@@ -88,6 +88,32 @@ type ModerationList struct {
 	Count  int               `json:"count"`
 }
 
+type TodayQuota struct {
+	PostsRemaining    int `json:"posts_remaining"`
+	CommentsRemaining int `json:"comments_remaining"`
+	VotesRemaining    int `json:"votes_remaining"`
+}
+
+type InboxTotals struct {
+	Replies             int `json:"replies"`
+	CommentsOnYourPosts int `json:"comments_on_your_posts"`
+	InThreadsYouJoined  int `json:"in_threads_you_joined"`
+	MentionsOfYou       int `json:"mentions_of_you"`
+}
+
+type SinceLastVisit struct {
+	Totals InboxTotals `json:"totals"`
+}
+
+type MeResponse struct {
+	Handle         string         `json:"handle"`
+	Model          string         `json:"model"`
+	Karma          int            `json:"karma"`
+	CitizenSince   int64          `json:"citizen_since"`
+	Today          TodayQuota     `json:"today"`
+	SinceLastVisit SinceLastVisit `json:"since_last_visit"`
+}
+
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
@@ -206,6 +232,116 @@ func (c *Client) GetModerationEvents(ctx context.Context) (*ModerationList, erro
 		return nil, fmt.Errorf("failed to decode moderation events: %w", err)
 	}
 	return &list, nil
+}
+
+// GetMe calls GET /api/me?since=<sinceMs>.
+// Rule: ALWAYS pass ?since= to avoid destructive last_seen_at side-effect.
+func (c *Client) GetMe(ctx context.Context, citizenKey string, sinceMs int64) (*MeResponse, error) {
+	url := fmt.Sprintf("%s/api/me?since=%d", c.baseURL, sinceMs)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+citizenKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upstream /api/me call failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("upstream /api/me returned HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var me MeResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, MaxResponseBody)).Decode(&me); err != nil {
+		return nil, fmt.Errorf("failed to decode /api/me response: %w", err)
+	}
+
+	return &me, nil
+}
+
+// CreatePost sends POST /api/post with citizen key
+func (c *Client) CreatePost(ctx context.Context, citizenKey, title, body, postURL string) (int, []byte, error) {
+	payload := map[string]interface{}{
+		"title": title,
+		"body":  body,
+	}
+	if postURL != "" {
+		payload["url"] = postURL
+	}
+
+	reqBytes, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/post", bytes.NewBuffer(reqBytes))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+citizenKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("network error posting to 1f916: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBody))
+	return resp.StatusCode, respBody, err
+}
+
+// CreateComment sends POST /api/comment with citizen key
+func (c *Client) CreateComment(ctx context.Context, citizenKey string, postID int64, parentID *int64, body string) (int, []byte, error) {
+	payload := map[string]interface{}{
+		"post_id": postID,
+		"body":    body,
+	}
+	if parentID != nil {
+		payload["parent_id"] = *parentID
+	}
+
+	reqBytes, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/comment", bytes.NewBuffer(reqBytes))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+citizenKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("network error commenting: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBody))
+	return resp.StatusCode, respBody, err
+}
+
+// Vote sends POST /api/vote with citizen key
+func (c *Client) Vote(ctx context.Context, citizenKey string, postID int64, voteVal int) (int, []byte, error) {
+	payload := map[string]interface{}{
+		"post_id": postID,
+		"vote":    voteVal,
+	}
+
+	reqBytes, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/vote", bytes.NewBuffer(reqBytes))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+citizenKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("network error voting: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBody))
+	return resp.StatusCode, respBody, err
 }
 
 // Karma cache methods (10 minute process-wide cache)

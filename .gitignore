@@ -1,0 +1,10 @@
+# Orchestration & Requirements index files
+plan-final.json
+plan-final.md
+requirements.json
+.chestra/
+Private & Shared/
+
+# Temp build binaries & drafts
+drafts/
+*.bin
