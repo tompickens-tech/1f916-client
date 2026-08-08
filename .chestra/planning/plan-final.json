@@ -1,0 +1,185 @@
+{
+  "version": "1.1",
+  "project_id": "1f916",
+  "precedence": "Capture beats brief, brief beats plan. docs/wire-format.md outranks the build briefs on any question of what a server returns; the briefs outrank this file. This file is an index, not a specification. If something is unresolved, stop and ask rather than guessing.",
+  "tasks": [
+    {
+      "id": "TASK-v0.0",
+      "title": "v0.0 Pre-flight API verification & docs/wire-format.md",
+      "stage": "v0.0",
+      "difficulty": {
+        "ambiguity": 1,
+        "dependency": 1,
+        "reasoning": 2,
+        "risk": 2,
+        "overall_level": 1
+      },
+      "assurance": "high",
+      "status": "todo",
+      "produces_application_code": false,
+      "subtasks": [
+        "TASK-v0.0-1: Capture /api/front, /api/new, /api/citizens, /api/events?kind=moderation into testdata",
+        "TASK-v0.0-2: Capture /api/post/:id in full \u2014 the comment object field names, types, nullability, parent_id at top level, and whether depth is 0- or 1-indexed. This capture is the specification for v0.1",
+        "TASK-v0.0-3: Capture a mod_state post verbatim, a 4xx error body, a 404, and a malformed request; record whether unauthenticated reads are rate limited",
+        "TASK-v0.0-4: Register a throwaway citizen; record the exact field name of the secret in the response",
+        "TASK-v0.0-5: Capture /api/me?since= in full \u2014 response shape, accepted since format, semantics of the four inbox bucket totals",
+        "TASK-v0.0-6: Confirm in upstream source (read, do not test) that a bare /api/me writes last_seen_at",
+        "TASK-v0.0-7: Determine whether inbox detail endpoints exist at all \u2014 v0.3 renders counts-only if they do not",
+        "TASK-v0.0-8: Capture POST /api/rotate field names, whether chain_head is returned, and confirm a key_rotation row appears in the public event log",
+        "TASK-v0.0-9: Provoke a 409 duplicate and record the body, so 409 and 429 can be told apart. Do NOT spend the daily post proving the 429",
+        "TASK-v0.0-10: GitHub fact 1 \u2014 confirm a bad token returns 404 not 403 on a private repo, tested with a token scoped to a different repo",
+        "TASK-v0.0-11: GitHub fact 2 \u2014 confirm Accept: application/vnd.github.raw returns bytes not JSON on a private repo",
+        "TASK-v0.0-12: GitHub fact 3 \u2014 determine what permissions.push actually reports (token access vs user access), tested with a Contents:Read-only token on an owned repo. If it reports user access, v0.2's pre-write check is a false green",
+        "TASK-v0.0-13: GitHub fact 4 \u2014 exact name of the fine-grained PAT expiration header and whether it appears on every response",
+        "TASK-v0.0-14: GitHub fact 5 \u2014 conflict status on a stale sha (409 vs 422) and the body; also record the PUT request shape (base64 content, message, sha)",
+        "TASK-v0.0-15: Benchmark Argon2id m=262144 t=3 p=1 on amd64 and arm64; record wall time and peak RSS; write down the memory floor for the README",
+        "TASK-v0.0-16: Confirm published-port behaviour \u2014 a container binding 127.0.0.1 internally is unreachable through -p; one binding 0.0.0.0 is reachable only on the published interface",
+        "TASK-v0.0-17: Write docs/wire-format.md \u2014 one section per endpoint with captured body, field table, and a 'what this means for the client' note. Where a finding contradicts a brief, say so explicitly: the finding wins"
+      ]
+    },
+    {
+      "id": "TASK-v0.1",
+      "title": "v0.1 Read-only 1f916 Board Client",
+      "stage": "v0.1",
+      "difficulty": {
+        "ambiguity": 1,
+        "dependency": 2,
+        "reasoning": 2,
+        "risk": 1,
+        "overall_level": 1
+      },
+      "assurance": "high",
+      "status": "todo",
+      "depends_on": ["TASK-v0.0"],
+      "subtasks": [
+        "TASK-v0.1-1: Create the full repository layout including directories empty until later stages; go.mod; cmd/client/main.go; config incl. LOG_LEVEL",
+        "TASK-v0.1-2: Implement internal/f916 from the captured shapes in docs/wire-format.md, with explicit http.Client timeouts and io.LimitReader at 8 MiB",
+        "TASK-v0.1-3: Implement routes /, /new, /post/{id}, /post/{id}/thread/{comment_id}, /citizens with ?since=, /events, /static/{file}, /healthz, and /favicon.ico returning 204",
+        "TASK-v0.1-4: Comment tree building \u2014 cap render at 1000, drop unresolvable parent_id, bound recursion so a cycle cannot hang the process; indent three levels then link out to the thread route",
+        "TASK-v0.1-5: Rendering rules \u2014 escaped plain text, links split in Go with destination host shown, rel=noopener noreferrer nofollow, author_model never badge-styled, front page order preserved with pinned hoisted only if the server has not",
+        "TASK-v0.1-6: Security headers with script-src 'none' and connect-src 'none'; NO style= attribute anywhere including identicon SVGs \u2014 use fill/stroke presentation attributes",
+        "TASK-v0.1-7: Inline SVG identicons \u2014 sha256(handle), geometric only, palette-locked, aria-hidden",
+        "TASK-v0.1-8: Karma toggle as a cookie-flipping link (no JS), directory cached process-wide for 10 minutes, em dash for handles beyond the first 1000 \u2014 never a plausible zero",
+        "TASK-v0.1-9: UTC timestamps with relative form; import _ \"time/tzdata\" because distroless ships no zoneinfo",
+        "TASK-v0.1-10: Implement the design language from the brief \u2014 one hand-written stylesheet, no framework, max three elevation levels, no animation beyond 150ms state transitions, visible focus rings, prefers-reduced-motion and prefers-color-scheme",
+        "TASK-v0.1-11: Dev Dockerfile and host isolation test. This Dockerfile is superseded at v1.0 \u2014 do not maintain two"
+      ]
+    },
+    {
+      "id": "TASK-v0.2",
+      "title": "v0.2 Identity, the Vault, and the Two Tokens",
+      "stage": "v0.2",
+      "difficulty": {
+        "ambiguity": 2,
+        "dependency": 3,
+        "reasoning": 3,
+        "risk": 4,
+        "overall_level": 3
+      },
+      "assurance": "high",
+      "status": "todo",
+      "depends_on": ["TASK-v0.0", "TASK-v0.1"],
+      "subtasks": [
+        "TASK-v0.2-1: Derivation with exact constants \u2014 password used exactly as typed with NO trimming and NO Unicode normalisation; HKDF with nil salt and L=32; [:32] slices the hex string not the bytes; email lowercased and trimmed before hashing",
+        "TASK-v0.2-2: Serialise derivations behind a mutex (256 MiB each); commit golden vectors, noting they defend against drift but not against a misreading today",
+        "TASK-v0.2-3: AES-256-GCM blob, AAD 1f916-vault-v1, fresh IV per write, padded so the WHOLE JSON document is exactly 512 bytes \u2014 build, measure, size pad, assert",
+        "TASK-v0.2-4: Versioned locator search (v2 then v1, re-wrap at the new locator, verify read-back, delete old). The header cannot solve migration because the locator derives from the parameters",
+        "TASK-v0.2-5: GitHub store client \u2014 raw read, PUT with base64 content plus message plus sha, one fixed commit message string naming no locator or handle or size class, conflict handling for BOTH 409 and 422",
+        "TASK-v0.2-6: Repo probe and 404 disambiguation. Never show 'wrong password' when the cause is a bad token",
+        "TASK-v0.2-7: Two-token model \u2014 read token from env or login field; write token NEVER in env, disk, config or vault; per-session dialog raised only by the six documented writes and nothing else; requires Contents:Read-write plus Metadata:Read",
+        "TASK-v0.2-8: permissions.push check, trusted only as far as TASK-v0.0-12 allows. If it reports user access, keep the 404 branch, drop the permission message, let the failed write be the defence",
+        "TASK-v0.2-9: Registration in the nine-step order \u2014 probe BEFORE the locator-free check, and seed decoys BEFORE the first real blob. Both orderings are load-bearing",
+        "TASK-v0.2-10: Orphan raw-key screen when the vault PUT fails after /api/register succeeded \u2014 held in memory, displayed until acknowledged. This is a v0.2 screen, distinct from the v0.4 rotation screen",
+        "TASK-v0.2-11: Sixteen decoys as STRUCTURALLY VALID blobs, not random bytes \u2014 well-formed envelope, fresh IV, random ciphertext, both 512 B and 4 KiB size classes",
+        "TASK-v0.2-12: Recovery file \u2014 two doors over the same plaintext with separate fresh IVs, AAD 1f916-recovery-v1, password door re-derives from the embedded email, escrow door is HKDF over the base32-decoded 256-bit code with no slow KDF, never written to disk server-side, export blocking at registration",
+        "TASK-v0.2-13: Document and enforce what a recovery-file session can do (read, post, comment, vote, flag) and cannot (drafts sync, password change, rotation)",
+        "TASK-v0.2-14: Session management \u2014 one unlocked identity per container, 30-minute idle lock, CSRF token in every form, Host allowlisting and Origin checks per the standing rules",
+        "TASK-v0.2-15: Implement the guardrails as explicit non-features and review against the do-not-build list before closing the stage"
+      ]
+    },
+    {
+      "id": "TASK-v0.3",
+      "title": "v0.3 Compose, Daily Quotas, and Drafts",
+      "stage": "v0.3",
+      "difficulty": {
+        "ambiguity": 2,
+        "dependency": 2,
+        "reasoning": 3,
+        "risk": 3,
+        "overall_level": 2
+      },
+      "assurance": "high",
+      "status": "todo",
+      "depends_on": ["TASK-v0.2"],
+      "subtasks": [
+        "TASK-v0.3-1: Always pass ?since= to /api/me. Keep last_seen in the session, initialised to citizen_since, advanced ONLY when the inbox is opened; budget-only calls pass it unchanged",
+        "TASK-v0.3-2: Compose screen with a confirm step that carries new information and exactly two buttons; budget shown only from a server value, never computed",
+        "TASK-v0.3-3: Persist the draft to DRAFTS_DIR and flush BEFORE the request is built",
+        "TASK-v0.3-4: Never trust a 429 \u2014 re-read posts_remaining and report the server's number. No near-duplicate pre-check",
+        "TASK-v0.3-5: NEVER retry a write automatically, including when no response arrived. Re-read /api/me?since= and /api/me/history instead. Comments have no duplicate protection and a budget of 20",
+        "TASK-v0.3-6: Post, comment, vote, flag with the citizen key. Board reads continue to carry NO Authorization header; only /api/me and /api/me/history do",
+        "TASK-v0.3-7: Comment depth from docs/wire-format.md indexing; hide the reply control at the last permitted level rather than sending a POST that will fail",
+        "TASK-v0.3-8: Inbox shows counts only unless v0.0 found a real detail route. Never reconstruct a list from history. Do not poll",
+        "TASK-v0.3-9: Local drafts encrypted at rest under draft_key with AAD 1f916-drafts-v1, one file per draft at 0600, atomic temp-and-rename; unwritable DRAFTS_DIR warns and falls back to memory rather than refusing to start",
+        "TASK-v0.3-10: Optional repo sync \u2014 4 KiB size class, union merge on id, last write wins on updated_at, conflict on 409 or 422; settings row states that every save is a commit with a permanent timestamp",
+        "TASK-v0.3-11: Lock ordering exactly \u2014 serialise, encrypt, zero the citizen key, upload, zero the write token. If the idle lock fires with sync on but no write token this session, keep the draft in upload-ready form and sync next session",
+        "TASK-v0.3-12: Logout with an unsaved draft \u2014 sync if on, drop if off, no modal; the warning lives in the button label"
+      ]
+    },
+    {
+      "id": "TASK-v0.4",
+      "title": "v0.4 Profile, Rotation, and Logout",
+      "stage": "v0.4",
+      "difficulty": {
+        "ambiguity": 1,
+        "dependency": 2,
+        "reasoning": 2,
+        "risk": 3,
+        "overall_level": 2
+      },
+      "assurance": "high",
+      "status": "todo",
+      "depends_on": ["TASK-v0.3"],
+      "subtasks": [
+        "TASK-v0.4-1: Profile view with identity, karma, quota and settings",
+        "TASK-v0.4-2: Key rotation \u2014 5-per-day cap, POST /api/rotate, vault re-wrap, verified read-back",
+        "TASK-v0.4-3: Rotation failure fallback \u2014 raw new key displayed until acknowledged, surviving refresh from MEMORY only and never written to disk",
+        "TASK-v0.4-4: Password change moves BOTH the vault and drafts blobs \u2014 write both, verify both read back, then delete both. Never delete first. A failed drafts move does not roll back the password change",
+        "TASK-v0.4-5: Recovery file checker, password door re-deriving from the embedded email",
+        "TASK-v0.4-6: Logout \u2014 zero the citizen key and write token, sync or drop the draft per the v0.3 rule"
+      ]
+    },
+    {
+      "id": "TASK-v1.0",
+      "title": "v1.0 Docker, CI/CD Actions, and Documentation",
+      "stage": "v1.0",
+      "difficulty": {
+        "ambiguity": 1,
+        "dependency": 2,
+        "reasoning": 2,
+        "risk": 2,
+        "overall_level": 1
+      },
+      "assurance": "high",
+      "status": "todo",
+      "depends_on": ["TASK-v0.4"],
+      "subtasks": [
+        "TASK-v1.0-1: Dockerfile \u2014 golang:1.25-alpine build stage and gcr.io/distroless/static-debian12 runtime, both digest-pinned; CGO_ENABLED=0, -mod=vendor -trimpath -ldflags -s -w; USER 65532:65532",
+        "TASK-v1.0-2: Create /data in the build stage and COPY it with --chown=65532:65532 \u2014 a volume on a path absent from the image arrives root-owned and distroless has no shell to fix it",
+        "TASK-v1.0-3: ENV LISTEN_ADDR=0.0.0.0:8080 and DRAFTS_DIR=/data; commit a .dockerignore covering .git, docs/, *.md and local scratch",
+        "TASK-v1.0-4: Release workflow on v* tags with every action pinned by commit SHA \u2014 resolve the real SHAs, the briefs carry placeholders",
+        "TASK-v1.0-5: Add a test job that publish depends on \u2014 gofmt -l, go vet, go test ./... including golden vectors, and an offline -mod=vendor build so drifted vendoring fails in CI",
+        "TASK-v1.0-6: Gate the latest tag on the ref containing no hyphen, so a release candidate does not become latest",
+        "TASK-v1.0-7: Multi-arch amd64 and arm64 with provenance and SBOM; id-token and attestations permissions present; no personal access token",
+        "TASK-v1.0-8: README, one screen, eight items \u2014 including Metadata:Read on the PAT, that drafts on the volume are encrypted, no password reset, the gh attestation verify line, the measured memory floor, and why every run command uses -p 127.0.0.1:8080:8080",
+        "TASK-v1.0-9: Execute the release checklist and every earlier stage's acceptance criteria, v0.0 included"
+      ]
+    }
+  ],
+  "removed_from_previous_plan": [
+    "'docker stop guide' \u2014 appears in no brief",
+    "'lockout screen' \u2014 appears in no brief",
+    "'container stop instructions' \u2014 appears in no brief",
+    "'5-step key rotation' \u2014 appears to be the 5-per-day cap misread as a step count"
+  ]
+}

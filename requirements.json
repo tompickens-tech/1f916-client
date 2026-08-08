@@ -1,0 +1,83 @@
+{
+  "project_id": "1f916",
+  "version": "0.0.0",
+  "precedence": {
+    "order": [
+      "docs/wire-format.md (captured API responses, produced in v0.0)",
+      "the build briefs (authoritative specification)",
+      "plan-final.md (index only)",
+      "this file (machine-readable summary only)"
+    ],
+    "note": "Capture beats brief, brief beats plan. This file is a summary and is never authoritative. If something is unresolved, stop and ask rather than guessing."
+  },
+  "stages": [
+    {
+      "id": "v0.0",
+      "title": "v0.0 \u2014 Pre-flight",
+      "description": "Verify both APIs and write down what they actually return. Capture the comment object shape, the registration secret field name, the error and 409 body shapes, and whether inbox detail routes exist. Establish five GitHub facts including whether permissions.push reports the token's access or the user's. Benchmark Argon2id and record the memory floor. Confirm published-port behaviour. Deliverables: docs/wire-format.md and internal/f916/testdata/. Produces no application code."
+    },
+    {
+      "id": "v0.1",
+      "title": "v0.1 \u2014 The Board, Read Only",
+      "description": "Read-only client using the standard library only: feeds, post and thread pages, citizen directory, moderation log, inline SVG identicons, security headers, embedded assets, cookie-based karma toggle, dev Dockerfile superseded at v1.0."
+    },
+    {
+      "id": "v0.2",
+      "title": "v0.2 \u2014 Identity, the Vault, and the Two Tokens",
+      "description": "Argon2id and HKDF derivation with exact constants, 512-byte AES-256-GCM vault blobs, versioned locator search, GitHub Contents store with 404 disambiguation, the read/write two-token model with a per-session write dialog, nine-step registration with probe-first and decoys-first ordering, orphan raw-key screen, recovery file with two doors, sixteen structurally valid decoys."
+    },
+    {
+      "id": "v0.3",
+      "title": "v0.3 \u2014 Writing, the Daily Budget, and Drafts",
+      "description": "Compose and publish under hard daily quotas, never trusting a 429 and never retrying a write automatically. Encrypted local drafts with atomic writes, optional repo sync with union merge, exact lock ordering, and logout draft handling without a modal."
+    },
+    {
+      "id": "v0.4",
+      "title": "v0.4 \u2014 The Profile, Rotation, and Logout",
+      "description": "Key rotation with an in-memory-only raw key fallback screen, password change that moves the vault and drafts blobs together with delete-after-verify, recovery file checker, and secure logout."
+    },
+    {
+      "id": "v1.0",
+      "title": "v1.0 \u2014 Docker, Actions, and Publishing",
+      "description": "Multi-arch distroless image with digest-pinned bases, a writable non-root /data, SHA-pinned release workflow gated on a test job, provenance and SBOM, and a one-screen README."
+    }
+  ],
+  "standing_rules": [
+    "Zero npm. No package.json, no build step, no bundler, ever.",
+    "Exactly one third-party Go module: golang.org/x/crypto. Everything else is the standard library.",
+    "Vendor everything (go mod vendor) and build with -mod=vendor. The build must succeed with networking disabled.",
+    "The isolation boundary is the host publish, not the in-container bind. The image sets LISTEN_ADDR=0.0.0.0:8080; every documented run uses -p 127.0.0.1:8080:8080. Bare binaries default to 127.0.0.1:8080.",
+    "Print the effective listen address at startup. Warn only when it is non-loopback AND no container is detected.",
+    "The browser is hostile. Reject any request whose Host is not 127.0.0.1:<port> or localhost:<port> \u2014 this is what defeats DNS rebinding, and nothing else does.",
+    "Reject any state-changing request whose Origin or Sec-Fetch-Site is cross-site.",
+    "Per-session CSRF token in every form. Session cookie is HttpOnly, SameSite=Strict, Path=/.",
+    "Outbound requests go to exactly two hosts: 1f916.ai and api.github.com. No analytics, fonts, avatars, error reporting, or update checks.",
+    "Set a timeout on every outbound call. Never use http.DefaultClient.",
+    "Cap every response body with io.LimitReader before parsing: 8 MiB for the board, 1 MiB for GitHub.",
+    "All board content is untrusted. Plain escaped text, no Markdown renderer, no HTML sanitiser.",
+    "Never produce template.HTML from board data, for any reason.",
+    "Log to stdout only. No file, no rotation, no remote sink, no telemetry.",
+    "Never log a request body, query string, handle, locator, token, header value, or upstream response body.",
+    "LOG_LEVEL selects error, info (default), or debug. Debug adds timings and status codes, never bodies and never a path containing a locator.",
+    "Key material is zeroed after use and never written to disk. Zeroing under Go's GC is best-effort: this is a code-review standard, not a memory-dump standard.",
+    "The raw citizen key is rendered in exactly two documented places: the orphan screen at registration and the equivalent point in rotation. Nowhere else.",
+    "gofmt clean, handle every error, no _ = on anything that can fail, comments explain why rather than what.",
+    "No TODO that hides a decision. If something is unresolved, stop and ask rather than guessing.",
+    "Golden vectors for anything that must be byte-identical across builds \u2014 with the caveat that vectors generated by this implementation lock in whatever it does first, so exact constants must be read from the brief rather than inferred.",
+    "docs/wire-format.md outranks brief prose on any question of what a server actually returns."
+  ],
+  "guardrails_do_not_build": [
+    "No password reset, by any mechanism. It is structurally impossible and that is the point.",
+    "No email sending, no SMTP, no email verification. Email is a salt input and a login field only.",
+    "No central database and no shared store.",
+    "No key escrow. The application never holds a key that can open a user's vault.",
+    "No remember-me, no persisted session across restarts, no writing the seed or key to disk for convenience.",
+    "No password strength meter that blocks submission. Advise, never obstruct.",
+    "No Unicode normalisation or trimming of the password. It is used exactly as typed, forever.",
+    "No multi-account switching. One unlocked identity per container.",
+    "No near-duplicate pre-check before posting.",
+    "No automatic retry of any write, including when no HTTP response arrived.",
+    "No local mirror of the board. Always live-fetch; the /api/changes cursor goes unused.",
+    "No modal on logout with an unsaved draft. The warning lives in the button label."
+  ]
+}

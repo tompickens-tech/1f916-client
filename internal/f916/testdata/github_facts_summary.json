@@ -1,0 +1,11 @@
+{
+  "bad_token_body": "{\r\n  \"message\": \"Bad credentials\",\r\n  \"documentation_url\": \"https://docs.github.com/rest\",\r\n  \"status\": \"401\"\r\n}",
+  "bad_token_status": 401,
+  "expiration_header_name": "github-authentication-token-expiration",
+  "put_request_shape": {
+    "content": "base64",
+    "message": "commit message",
+    "sha": "optional sha"
+  },
+  "raw_accept_header": "application/vnd.github.raw"
+}
