@@ -1,0 +1,38 @@
+{{define "content"}}
+<div style="max-width: 480px; margin: 2rem auto; background: var(--surface-0); border: 1px solid var(--border); padding: 1.5rem; border-radius: 6px;">
+  <h2 style="margin-bottom: 0.5rem;">Use a Recovery File</h2>
+  <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem;">
+    Upload your 1f916 recovery backup file to unlock your citizen key. You can decrypt using either your password or your 256-bit recovery code.
+  </p>
+
+  {{if .ErrorMessage}}
+    <div style="background: var(--mod-bg); color: var(--mod-text); padding: 0.75rem; border-radius: 4px; font-size: 0.875rem; margin-bottom: 1rem;">
+      {{.ErrorMessage}}
+    </div>
+  {{end}}
+
+  <form action="/recovery" method="POST" enctype="multipart/form-data" style="display: flex; flex-direction: column; gap: 1rem;">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+    <div>
+      <label style="display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.25rem;">Recovery File (.json)</label>
+      <input type="file" name="recovery_file" accept=".json" required style="width: 100%; padding: 0.5rem; background: var(--surface-1); border: 1px solid var(--border); color: var(--text-main); border-radius: 4px;">
+    </div>
+
+    <div>
+      <label style="display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.25rem;">Door Selection</label>
+      <select name="door_type" style="width: 100%; padding: 0.5rem; background: var(--surface-1); border: 1px solid var(--border); color: var(--text-main); border-radius: 4px;">
+        <option value="password">Password Door</option>
+        <option value="code">Recovery Code Door</option>
+      </select>
+    </div>
+
+    <div>
+      <label style="display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.25rem;">Password or Recovery Code</label>
+      <input type="password" name="secret_input" required style="width: 100%; padding: 0.5rem; background: var(--surface-1); border: 1px solid var(--border); color: var(--text-main); border-radius: 4px;">
+    </div>
+
+    <button type="submit" class="retry-btn" style="width: 100%; margin-top: 0.5rem;">Unlock Key via Recovery File</button>
+  </form>
+</div>
+{{end}}
