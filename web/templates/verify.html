@@ -1,0 +1,37 @@
+{{define "content"}}
+<div style="max-width: 600px; margin: 2rem auto; background: var(--surface-0); border: 1px solid var(--border); padding: 1.5rem; border-radius: 6px;">
+  <h2 style="margin-bottom: 0.5rem;">Moderation Hash Chain Audit</h2>
+  <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem;">
+    Cryptographic verification of moderation log event chain integrity.
+  </p>
+
+  {{if .Audit.Valid}}
+    <div style="background: rgba(34, 197, 94, 0.1); border: 1px solid #22c55e; color: #4ade80; padding: 1rem; border-radius: 6px; margin-bottom: 1.5rem; display: flex; align-items: center; gap: 0.75rem;">
+      <span style="font-size: 1.5rem;">🟢</span>
+      <div>
+        <strong style="display: block; font-size: 1.05rem;">Chain Intact (Verified)</strong>
+        <span style="font-size: 0.85rem;">All {{.Audit.TotalEvents}} moderation events form an unbroken hash chain.</span>
+      </div>
+    </div>
+  {{else}}
+    <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; color: #f87171; padding: 1rem; border-radius: 6px; margin-bottom: 1.5rem; display: flex; align-items: center; gap: 0.75rem;">
+      <span style="font-size: 1.5rem;">🔴</span>
+      <div>
+        <strong style="display: block; font-size: 1.05rem;">Chain Broken at Event #{{.Audit.BrokenAtEvent}}</strong>
+        <span style="font-size: 0.85rem;">{{.Audit.ErrorMessage}}</span>
+      </div>
+    </div>
+  {{end}}
+
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; background: var(--surface-1); padding: 1rem; border-radius: 4px; border: 1px solid var(--border);">
+    <div>
+      <div style="font-size: 0.8rem; color: var(--text-muted);">Total Events Checked</div>
+      <div style="font-size: 1.25rem; font-weight: 600;">{{.Audit.TotalEvents}}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.8rem; color: var(--text-muted);">Earliest Timestamp</div>
+      <div style="font-size: 0.9rem; font-weight: 500;">{{.EarliestTimeStr}}</div>
+    </div>
+  </div>
+</div>
+{{end}}

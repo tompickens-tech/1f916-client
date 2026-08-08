@@ -59,7 +59,7 @@ func NewServer(client *f916.Client) (*Server, error) {
 		},
 	}
 
-	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose", "inbox", "rotate"}
+	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose", "inbox", "rotate", "verify"}
 	tmpls := make(map[string]*template.Template)
 
 	for _, page := range pages {
@@ -143,6 +143,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /inbox", s.handleInboxGet)
 	mux.HandleFunc("GET /rotate", s.handleRotateGet)
 	mux.HandleFunc("POST /rotate", s.handleRotatePost)
+	mux.HandleFunc("GET /verify", s.handleVerifyGet)
 
 	mux.HandleFunc("GET /static/", http.FileServer(http.FS(webassets.StaticFS)).ServeHTTP)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -1052,8 +1053,7 @@ func (s *Server) handleInboxGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Always pass ?since= timestamp to avoid reset side-effects
-	sinceMs := time.Now().UnixMilli() - 86400000 // default 24h
+	sinceMs := time.Now().UnixMilli() - 86400000
 	me, err := s.client.GetMe(r.Context(), sess.CitizenKey, sinceMs)
 	if err != nil {
 		s.renderError(w, r, fmt.Sprintf("Failed to fetch inbox: %v", err))
@@ -1100,14 +1100,12 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 
 	password := r.FormValue("password")
 
-	// 1. Call POST /api/rotate on 1f916.ai
 	rotResp, err := s.client.RotateKey(r.Context(), sess.CitizenKey)
 	if err != nil {
 		s.renderRotateError(w, r, fmt.Sprintf("Key rotation failed on server: %v", err))
 		return
 	}
 
-	// 2. Re-derive keys from password + email
 	kd, err := vault.DeriveKeys(sess.Email, password)
 	if err != nil {
 		s.renderOrphanKey(w, r, rotResp.NewSecret)
@@ -1115,7 +1113,6 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 	}
 	defer kd.Zero()
 
-	// 3. Encrypt new vault blob with new secret key
 	pt := &vault.VaultPlaintext{
 		V:      1,
 		Secret: rotResp.NewSecret,
@@ -1127,7 +1124,6 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch existing SHA for file
 	blobPath := "v/" + kd.Locator + ".bin"
 	meta, err := s.storeClient.GetBlobMetadata(r.Context(), sess.Repo, sess.ReadToken, blobPath)
 	existingSHA := ""
@@ -1135,19 +1131,16 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 		existingSHA = meta.SHA
 	}
 
-	// 4. Upload updated vault blob to GitHub store
 	writeToken := sess.WriteToken
 	if writeToken == "" {
 		writeToken = sess.ReadToken
 	}
 
 	if err := s.storeClient.PutBlob(r.Context(), sess.Repo, writeToken, blobPath, blobData, existingSHA); err != nil {
-		// Vault PUT failed after rotation -> Render orphan key screen!
 		s.renderOrphanKey(w, r, rotResp.NewSecret)
 		return
 	}
 
-	// Rotation succeeded: update session secret key
 	sess.CitizenKey = rotResp.NewSecret
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -1164,4 +1157,28 @@ func (s *Server) renderRotateError(w http.ResponseWriter, r *http.Request, msg s
 		"CSRFToken":    session.GenerateRandomID(16),
 	}
 	s.templates["rotate"].Execute(w, data)
+}
+
+// Stage v0.5 Handlers: Moderation Audit & Verification
+
+func (s *Server) handleVerifyGet(w http.ResponseWriter, r *http.Request) {
+	list, err := s.client.GetModerationEvents(r.Context())
+	if err != nil {
+		s.renderError(w, r, fmt.Sprintf("Failed to fetch moderation events: %v", err))
+		return
+	}
+
+	audit := f916.AuditModerationChain(list.Events)
+	earliestStr, _ := FormatUTCAndRelative(audit.EarliestTime)
+
+	data := map[string]interface{}{
+		"Title":           "Verify Moderation Audit",
+		"ActiveNav":       "",
+		"CurrentPath":     r.URL.Path,
+		"KarmaOn":         s.isKarmaOn(r),
+		"Session":         s.getSession(r),
+		"Audit":           audit,
+		"EarliestTimeStr": earliestStr,
+	}
+	s.templates["verify"].Execute(w, data)
 }
