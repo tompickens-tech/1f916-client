@@ -10,94 +10,119 @@ import (
 )
 
 type Session struct {
-	ID         string
-	Email      string
-	Handle     string
-	CitizenKey string // secret key 1f916_sk_...
-	ReadToken  string
-	WriteToken string
-	Repo       string
-	CSRFToken  string
-	IsRecovery bool // Session opened via recovery file (no store/token write capabilities)
+	ID                string
+	Email             string
+	Handle            string
+	CitizenKeyBytes   []byte // secret key bytes 1f916_sk_...
+	ReadToken         string
+	WriteTokenBytes   []byte
+	Repo              string
+	CSRFToken         string
+	IsRecovery        bool // Session opened via recovery file
+	RecoveryFileBytes []byte
 
 	LastActive time.Time
 }
 
+func (s *Session) CitizenKey() string {
+	return string(s.CitizenKeyBytes)
+}
+
+func (s *Session) WriteToken() string {
+	return string(s.WriteTokenBytes)
+}
+
 func (s *Session) ZeroSecrets() {
-	if s.CitizenKey != "" {
-		keyBytes := []byte(s.CitizenKey)
-		vault.ZeroBytes(keyBytes)
-		s.CitizenKey = ""
+	if len(s.CitizenKeyBytes) > 0 {
+		vault.ZeroBytes(s.CitizenKeyBytes)
+		s.CitizenKeyBytes = nil
 	}
-	if s.WriteToken != "" {
-		tokenBytes := []byte(s.WriteToken)
-		vault.ZeroBytes(tokenBytes)
-		s.WriteToken = ""
+	if len(s.WriteTokenBytes) > 0 {
+		vault.ZeroBytes(s.WriteTokenBytes)
+		s.WriteTokenBytes = nil
+	}
+	if len(s.RecoveryFileBytes) > 0 {
+		vault.ZeroBytes(s.RecoveryFileBytes)
+		s.RecoveryFileBytes = nil
 	}
 }
 
 type Manager struct {
-	mutex   sync.RWMutex
-	current *Session
+	mutex    sync.Mutex
+	sessions map[string]*Session
 }
 
 func NewManager() *Manager {
-	return &Manager{}
+	return &Manager{
+		sessions: make(map[string]*Session),
+	}
 }
 
 func GenerateRandomID(bytesLen int) string {
 	b := make([]byte, bytesLen)
-	rand.Read(b)
+	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-func (m *Manager) GetActiveSession() *Session {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
+func (m *Manager) GetSession(id string) *Session {
+	if id == "" {
+		return nil
+	}
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
-	if m.current == nil {
+	sess, ok := m.sessions[id]
+	if !ok {
 		return nil
 	}
 
 	// 30-minute idle lock
-	if time.Since(m.current.LastActive) > 30*time.Minute {
-		// Idle lock triggered! Secret key & write token zeroed.
+	if time.Since(sess.LastActive) > 30*time.Minute {
+		sess.ZeroSecrets()
+		delete(m.sessions, id)
 		return nil
 	}
 
-	m.current.LastActive = time.Now()
-	return m.current
+	sess.LastActive = time.Now()
+	return sess
 }
 
 func (m *Manager) SetSession(sess *Session) {
+	if sess == nil || sess.ID == "" {
+		return
+	}
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-
-	// One unlocked identity per container: zero old identity first
-	if m.current != nil {
-		m.current.ZeroSecrets()
-	}
 
 	sess.LastActive = time.Now()
-	m.current = sess
+	m.sessions[sess.ID] = sess
 }
 
-func (m *Manager) ClearSession() {
+func (m *Manager) ClearSession(id string) {
+	if id == "" {
+		return
+	}
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	if m.current != nil {
-		m.current.ZeroSecrets()
-		m.current = nil
+	if sess, ok := m.sessions[id]; ok {
+		sess.ZeroSecrets()
+		delete(m.sessions, id)
 	}
 }
 
-func (m *Manager) UpdateWriteToken(token string) {
+func (m *Manager) UpdateWriteToken(id string, token string) {
+	if id == "" {
+		return
+	}
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	if m.current != nil {
-		m.current.WriteToken = token
-		m.current.LastActive = time.Now()
+	if sess, ok := m.sessions[id]; ok {
+		if len(sess.WriteTokenBytes) > 0 {
+			vault.ZeroBytes(sess.WriteTokenBytes)
+		}
+		sess.WriteTokenBytes = []byte(token)
+		sess.LastActive = time.Now()
 	}
 }

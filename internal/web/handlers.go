@@ -2,11 +2,13 @@ package web
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -29,16 +31,71 @@ type Server struct {
 	templates      map[string]*template.Template
 	orphanKey      string
 	pendingReg     *PendingRegistration
+	pendingMu      sync.Mutex
+	loginLimiter   *LoginLimiter
 
 	sentTokensMutex sync.Mutex
 	usedSendTokens  map[string]bool
 }
 
 type PendingRegistration struct {
-	Handle   string
-	Model    string
-	Email    string
-	Password string
+	Handle        string
+	Model         string
+	Email         string
+	PasswordBytes []byte
+	CreatedAt     time.Time
+}
+
+func (p *PendingRegistration) ZeroSecrets() {
+	if len(p.PasswordBytes) > 0 {
+		vault.ZeroBytes(p.PasswordBytes)
+		p.PasswordBytes = nil
+	}
+}
+
+type LoginLimiter struct {
+	mu       sync.Mutex
+	attempts map[string]int
+	locked   map[string]time.Time
+}
+
+func NewLoginLimiter() *LoginLimiter {
+	return &LoginLimiter{
+		attempts: make(map[string]int),
+		locked:   make(map[string]time.Time),
+	}
+}
+
+func (l *LoginLimiter) CheckAllowed(ip string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if lockUntil, ok := l.locked[ip]; ok {
+		if time.Now().Before(lockUntil) {
+			return fmt.Errorf("too many failed login attempts. Please try again after %s", time.Until(lockUntil).Round(time.Second))
+		}
+		delete(l.locked, ip)
+		delete(l.attempts, ip)
+	}
+	return nil
+}
+
+func (l *LoginLimiter) RecordFailure(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.attempts[ip]++
+	if l.attempts[ip] >= 5 {
+		l.locked[ip] = time.Now().Add(15 * time.Minute)
+	}
+}
+
+func (l *LoginLimiter) RecordSuccess(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	delete(l.attempts, ip)
+	delete(l.locked, ip)
 }
 
 func NewServer(client *f916.Client) (*Server, error) {
@@ -59,7 +116,7 @@ func NewServer(client *f916.Client) (*Server, error) {
 		},
 	}
 
-	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose", "inbox", "rotate", "verify"}
+	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose", "inbox", "rotate", "verify", "recovery_created"}
 	tmpls := make(map[string]*template.Template)
 
 	for _, page := range pages {
@@ -75,12 +132,56 @@ func NewServer(client *f916.Client) (*Server, error) {
 		storeClient:    store.NewClient(),
 		sessionManager: session.NewManager(),
 		templates:      tmpls,
+		loginLimiter:   NewLoginLimiter(),
 		usedSendTokens: make(map[string]bool),
 	}, nil
 }
 
 func (s *Server) getSession(r *http.Request) *session.Session {
-	return s.sessionManager.GetActiveSession()
+	cookie, err := r.Cookie("1f916_sid")
+	if err != nil || cookie.Value == "" {
+		return nil
+	}
+	return s.sessionManager.GetSession(cookie.Value)
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter, sess *session.Session) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "1f916_sid",
+		Value:    sess.ID,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("1f916_sid")
+	if err == nil && cookie.Value != "" {
+		s.sessionManager.ClearSession(cookie.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "1f916_sid",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func (s *Server) verifyCSRF(w http.ResponseWriter, r *http.Request, sess *session.Session) bool {
+	if sess == nil {
+		s.renderError(w, r, "Unauthorized: Active session required", http.StatusUnauthorized)
+		return false
+	}
+	submitted := r.FormValue("csrf_token")
+	if submitted == "" || sess.CSRFToken == "" || subtle.ConstantTimeCompare([]byte(submitted), []byte(sess.CSRFToken)) != 1 {
+		s.renderError(w, r, "Forbidden: Invalid or missing CSRF token", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 func (s *Server) SecurityMiddleware(next http.Handler) http.Handler {
@@ -102,7 +203,8 @@ func (s *Server) SecurityMiddleware(next http.Handler) http.Handler {
 
 		if r.Method == http.MethodPost {
 			fetchSite := r.Header.Get("Sec-Fetch-Site")
-			if fetchSite != "" && fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none" {
+			// Audit Finding 2: Reject empty or cross-site Sec-Fetch-Site headers on POST requests
+			if fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none" {
 				http.Error(w, "Forbidden: Cross-Site POST rejected", http.StatusForbidden)
 				return
 			}
@@ -130,6 +232,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /write-token", s.handleWriteTokenGet)
 	mux.HandleFunc("POST /write-token", s.handleWriteTokenPost)
 	mux.HandleFunc("POST /acknowledge-key", s.handleAcknowledgeKey)
+	mux.HandleFunc("GET /download-recovery", s.handleDownloadRecovery)
 	mux.HandleFunc("GET /logout", s.handleLogout)
 	mux.HandleFunc("POST /logout", s.handleLogout)
 
@@ -169,7 +272,11 @@ func (s *Server) isKarmaOn(r *http.Request) bool {
 	return err == nil && cookie.Value == "on"
 }
 
-func (s *Server) renderError(w http.ResponseWriter, r *http.Request, msg string) {
+func (s *Server) renderError(w http.ResponseWriter, r *http.Request, msg string, statusCode ...int) {
+	code := http.StatusInternalServerError
+	if len(statusCode) > 0 && statusCode[0] != 0 {
+		code = statusCode[0]
+	}
 	data := map[string]interface{}{
 		"Title":        "Error",
 		"ErrorMessage": msg,
@@ -177,8 +284,23 @@ func (s *Server) renderError(w http.ResponseWriter, r *http.Request, msg string)
 		"KarmaOn":      s.isKarmaOn(r),
 		"ActiveNav":    "",
 	}
-	w.WriteHeader(http.StatusOK)
-	s.templates["error"].Execute(w, data)
+	w.WriteHeader(code)
+	s.renderTemplate(w, "error", data)
+}
+
+func (s *Server) renderTemplate(w http.ResponseWriter, name string, data interface{}) {
+	tmpl, ok := s.templates[name]
+	if !ok {
+		http.Error(w, "Template not found", http.StatusInternalServerError)
+		return
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		log.Printf("Template execution error (%s): %v", name, err)
+		http.Error(w, "Internal Server Error rendering template", http.StatusInternalServerError)
+		return
+	}
+	_, _ = buf.WriteTo(w)
 }
 
 func (s *Server) handleFront(w http.ResponseWriter, r *http.Request) {
@@ -255,14 +377,14 @@ func (s *Server) renderFeed(w http.ResponseWriter, r *http.Request, posts []f916
 		"Session":     s.getSession(r),
 	}
 
-	s.templates["front"].Execute(w, data)
+	s.renderTemplate(w, "front", data)
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
-		s.renderError(w, r, "Invalid post ID")
+		s.renderError(w, r, "Invalid post ID", http.StatusBadRequest)
 		return
 	}
 
@@ -279,14 +401,14 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
-		s.renderError(w, r, "Invalid post ID")
+		s.renderError(w, r, "Invalid post ID", http.StatusBadRequest)
 		return
 	}
 
 	commentIDStr := r.PathValue("comment_id")
 	commentID, err := strconv.ParseInt(commentIDStr, 10, 64)
 	if err != nil {
-		s.renderError(w, r, "Invalid comment ID")
+		s.renderError(w, r, "Invalid comment ID", http.StatusBadRequest)
 		return
 	}
 
@@ -325,6 +447,12 @@ func (s *Server) renderPostDetail(w http.ResponseWriter, r *http.Request, detail
 
 	commentNodes := BuildCommentTree(detail.Comments, rootCommentID)
 
+	sess := s.getSession(r)
+	csrfToken := ""
+	if sess != nil {
+		csrfToken = sess.CSRFToken
+	}
+
 	data := map[string]interface{}{
 		"Title":         detail.Post.Title,
 		"ActiveNav":     "",
@@ -333,11 +461,11 @@ func (s *Server) renderPostDetail(w http.ResponseWriter, r *http.Request, detail
 		"KarmaOn":       karmaOn,
 		"KarmaMap":      karmaMap,
 		"CurrentPath":   r.URL.Path,
-		"Session":       s.getSession(r),
-		"CSRFToken":     session.GenerateRandomID(16),
+		"Session":       sess,
+		"CSRFToken":     csrfToken,
 	}
 
-	s.templates["post"].Execute(w, data)
+	s.renderTemplate(w, "post", data)
 }
 
 type CitizenViewModel struct {
@@ -388,7 +516,7 @@ func (s *Server) handleCitizens(w http.ResponseWriter, r *http.Request) {
 		"Session":     s.getSession(r),
 	}
 
-	s.templates["citizens"].Execute(w, data)
+	s.renderTemplate(w, "citizens", data)
 }
 
 type EventViewModel struct {
@@ -429,12 +557,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		"Session":     s.getSession(r),
 	}
 
-	s.templates["events"].Execute(w, data)
+	s.renderTemplate(w, "events", data)
 }
 
 func (s *Server) handleToggleKarma(w http.ResponseWriter, r *http.Request) {
 	redirect := r.URL.Query().Get("redirect")
-	if redirect == "" || !strings.HasPrefix(redirect, "/") {
+	// Audit Finding 12: Reject protocol-relative open redirects starting with //
+	if redirect == "" || !strings.HasPrefix(redirect, "/") || strings.HasPrefix(redirect, "//") {
 		redirect = "/"
 	}
 
@@ -455,8 +584,6 @@ func (s *Server) handleToggleKarma(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirect, http.StatusSeeOther)
 }
 
-// Stage v0.2 Handlers: Login, Registration, Recovery, Write Token
-
 func (s *Server) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	envRepo := os.Getenv("VAULT_REPO")
 	envToken := os.Getenv("VAULT_TOKEN")
@@ -470,10 +597,21 @@ func (s *Server) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 		"EnvTokenConfigured": envToken != "",
 		"CSRFToken":          session.GenerateRandomID(16),
 	}
-	s.templates["login"].Execute(w, data)
+	s.renderTemplate(w, "login", data)
 }
 
 func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+
+	// Audit Finding 9: Login rate limiting
+	if err := s.loginLimiter.CheckAllowed(ip); err != nil {
+		s.renderLoginError(w, r, err.Error(), http.StatusTooManyRequests)
+		return
+	}
+
 	email := r.FormValue("email")
 	password := r.FormValue("password")
 
@@ -489,44 +627,55 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if repo == "" || token == "" {
-		s.renderLoginError(w, r, "Vault Repository and Read Token are required.")
+		s.loginLimiter.RecordFailure(ip)
+		s.renderLoginError(w, r, "Vault Repository and Read Token are required.", http.StatusBadRequest)
 		return
 	}
 
 	kd, err := vault.DeriveKeys(email, password)
 	if err != nil {
-		s.renderLoginError(w, r, err.Error())
+		s.loginLimiter.RecordFailure(ip)
+		s.renderLoginError(w, r, err.Error(), http.StatusBadRequest)
 		return
 	}
 	defer kd.Zero()
 
 	blobBytes, _, err := s.storeClient.GetBlob(r.Context(), repo, token, kd.Locator)
 	if err != nil {
-		s.renderLoginError(w, r, err.Error())
+		s.loginLimiter.RecordFailure(ip)
+		s.renderLoginError(w, r, err.Error(), http.StatusUnauthorized)
 		return
 	}
 
 	pt, err := vault.DecryptVaultBlob(kd.KEK, blobBytes)
 	if err != nil {
-		s.renderLoginError(w, r, fmt.Sprintf("Vault decryption failed: %v", err))
+		s.loginLimiter.RecordFailure(ip)
+		s.renderLoginError(w, r, fmt.Sprintf("Vault decryption failed: %v", err), http.StatusUnauthorized)
 		return
 	}
 
+	s.loginLimiter.RecordSuccess(ip)
+
 	sess := &session.Session{
-		ID:         session.GenerateRandomID(16),
-		Email:      email,
-		Handle:     pt.Handle,
-		CitizenKey: pt.Secret,
-		ReadToken:  token,
-		Repo:       repo,
-		CSRFToken:  session.GenerateRandomID(16),
+		ID:              session.GenerateRandomID(16),
+		Email:           email,
+		Handle:          pt.Handle,
+		CitizenKeyBytes: []byte(pt.Secret),
+		ReadToken:       token,
+		Repo:            repo,
+		CSRFToken:       session.GenerateRandomID(16),
 	}
 	s.sessionManager.SetSession(sess)
+	s.setSessionCookie(w, sess)
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func (s *Server) renderLoginError(w http.ResponseWriter, r *http.Request, msg string) {
+func (s *Server) renderLoginError(w http.ResponseWriter, r *http.Request, msg string, statusCode ...int) {
+	code := http.StatusOK
+	if len(statusCode) > 0 && statusCode[0] != 0 {
+		code = statusCode[0]
+	}
 	envRepo := os.Getenv("VAULT_REPO")
 	envToken := os.Getenv("VAULT_TOKEN")
 
@@ -539,7 +688,8 @@ func (s *Server) renderLoginError(w http.ResponseWriter, r *http.Request, msg st
 		"EnvTokenConfigured": envToken != "",
 		"CSRFToken":          session.GenerateRandomID(16),
 	}
-	s.templates["login"].Execute(w, data)
+	w.WriteHeader(code)
+	s.renderTemplate(w, "login", data)
 }
 
 func (s *Server) handleRegisterGet(w http.ResponseWriter, r *http.Request) {
@@ -550,7 +700,17 @@ func (s *Server) handleRegisterGet(w http.ResponseWriter, r *http.Request) {
 		"KarmaOn":     s.isKarmaOn(r),
 		"CSRFToken":   session.GenerateRandomID(16),
 	}
-	s.templates["register"].Execute(w, data)
+	s.renderTemplate(w, "register", data)
+}
+
+func (s *Server) clearPendingReg() {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+
+	if s.pendingReg != nil {
+		s.pendingReg.ZeroSecrets()
+		s.pendingReg = nil
+	}
 }
 
 func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
@@ -561,7 +721,7 @@ func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	passwordConfirm := r.FormValue("password_confirm")
 
 	if passwordConfirm != "" && password != passwordConfirm {
-		s.renderRegisterError(w, r, "Password confirmation does not match.")
+		s.renderRegisterError(w, r, "Password confirmation does not match.", http.StatusBadRequest)
 		return
 	}
 
@@ -569,41 +729,49 @@ func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	readToken := os.Getenv("VAULT_TOKEN")
 
 	if repo == "" || readToken == "" {
-		s.renderRegisterError(w, r, "VAULT_REPO and VAULT_TOKEN must be configured in environment or settings before registration.")
+		s.renderRegisterError(w, r, "VAULT_REPO and VAULT_TOKEN must be configured in environment or settings before registration.", http.StatusBadRequest)
 		return
 	}
 
 	probe, err := s.storeClient.ProbeRepo(r.Context(), repo, readToken)
 	if err != nil {
-		s.renderRegisterError(w, r, fmt.Sprintf("Repository probe failed: %v", err))
+		s.renderRegisterError(w, r, fmt.Sprintf("Repository probe failed: %v", err), http.StatusBadRequest)
 		return
 	}
 	_ = probe
 
 	kd, err := vault.DeriveKeys(email, password)
 	if err != nil {
-		s.renderRegisterError(w, r, err.Error())
+		s.renderRegisterError(w, r, err.Error(), http.StatusBadRequest)
 		return
 	}
 	defer kd.Zero()
 
 	_, _, getErr := s.storeClient.GetBlob(r.Context(), repo, readToken, kd.Locator)
 	if getErr == nil {
-		s.renderRegisterError(w, r, "A vault already exists at this derived locator. Please log in instead.")
+		s.renderRegisterError(w, r, "A vault already exists at this derived locator. Please log in instead.", http.StatusConflict)
 		return
 	}
 
+	s.clearPendingReg()
+	s.pendingMu.Lock()
 	s.pendingReg = &PendingRegistration{
-		Handle:   handle,
-		Model:    model,
-		Email:    email,
-		Password: password,
+		Handle:        handle,
+		Model:         model,
+		Email:         email,
+		PasswordBytes: []byte(password),
+		CreatedAt:     time.Now(),
 	}
+	s.pendingMu.Unlock()
 
 	http.Redirect(w, r, "/write-token?next=register", http.StatusSeeOther)
 }
 
-func (s *Server) renderRegisterError(w http.ResponseWriter, r *http.Request, msg string) {
+func (s *Server) renderRegisterError(w http.ResponseWriter, r *http.Request, msg string, statusCode ...int) {
+	code := http.StatusOK
+	if len(statusCode) > 0 && statusCode[0] != 0 {
+		code = statusCode[0]
+	}
 	data := map[string]interface{}{
 		"Title":        "Register Citizen",
 		"ErrorMessage": msg,
@@ -611,7 +779,8 @@ func (s *Server) renderRegisterError(w http.ResponseWriter, r *http.Request, msg
 		"KarmaOn":      s.isKarmaOn(r),
 		"CSRFToken":    session.GenerateRandomID(16),
 	}
-	s.templates["register"].Execute(w, data)
+	w.WriteHeader(code)
+	s.renderTemplate(w, "register", data)
 }
 
 func (s *Server) handleWriteTokenGet(w http.ResponseWriter, r *http.Request) {
@@ -626,7 +795,7 @@ func (s *Server) handleWriteTokenGet(w http.ResponseWriter, r *http.Request) {
 		"KarmaOn":     s.isKarmaOn(r),
 		"CSRFToken":   session.GenerateRandomID(16),
 	}
-	s.templates["write_token"].Execute(w, data)
+	s.renderTemplate(w, "write_token", data)
 }
 
 func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
@@ -637,6 +806,7 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 
 	probe, err := s.storeClient.ProbeRepo(r.Context(), repo, writeToken)
 	if err != nil {
+		s.clearPendingReg()
 		data := map[string]interface{}{
 			"Title":        "GitHub Write Token",
 			"ErrorMessage": fmt.Sprintf("Write token check failed: %v", err),
@@ -646,11 +816,12 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			"KarmaOn":      s.isKarmaOn(r),
 			"CSRFToken":    session.GenerateRandomID(16),
 		}
-		s.templates["write_token"].Execute(w, data)
+		s.renderTemplate(w, "write_token", data)
 		return
 	}
 
 	if !probe.Permissions.Push {
+		s.clearPendingReg()
 		data := map[string]interface{}{
 			"Title":        "GitHub Write Token",
 			"ErrorMessage": "This token can read your vault but not change it. You need one with Contents: Read and write.",
@@ -660,13 +831,30 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			"KarmaOn":      s.isKarmaOn(r),
 			"CSRFToken":    session.GenerateRandomID(16),
 		}
-		s.templates["write_token"].Execute(w, data)
+		s.renderTemplate(w, "write_token", data)
 		return
 	}
 
-	if nextAction == "register" && s.pendingReg != nil {
+	if nextAction == "rotate" {
+		sess := s.getSession(r)
+		if sess != nil {
+			s.sessionManager.UpdateWriteToken(sess.ID, writeToken)
+			http.Redirect(w, r, "/rotate", http.StatusSeeOther)
+			return
+		}
+	}
+
+	if nextAction == "register" {
+		s.pendingMu.Lock()
 		reg := s.pendingReg
 		s.pendingReg = nil
+		s.pendingMu.Unlock()
+
+		if reg == nil || time.Since(reg.CreatedAt) > 15*time.Minute {
+			s.renderRegisterError(w, r, "Registration session expired. Please try registering again.", http.StatusBadRequest)
+			return
+		}
+		defer reg.ZeroSecrets()
 
 		isNew, _ := s.storeClient.CheckIsNewStore(r.Context(), repo, readToken)
 		if isNew {
@@ -678,81 +866,89 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		regBody := fmt.Sprintf(`{"handle":"%s","model":"%s"}`, reg.Handle, reg.Model)
-		resp, err := http.Post("https://1f916.ai/api/register", "application/json", bytes.NewBufferString(regBody))
+		// Audit Finding 5: Route registration through f916 Client (json.Marshal + 10-second client)
+		secretKey, err := s.client.RegisterCitizen(r.Context(), reg.Handle, reg.Model)
 		if err != nil {
-			s.renderRegisterError(w, r, fmt.Sprintf("Registration API failed: %v", err))
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == 409 {
-			s.renderRegisterError(w, r, fmt.Sprintf("Handle '%s' is already taken on 1f916 board.", reg.Handle))
+			s.renderRegisterError(w, r, fmt.Sprintf("Registration API failed: %v", err), http.StatusBadRequest)
 			return
 		}
 
-		if resp.StatusCode != 201 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			s.renderRegisterError(w, r, fmt.Sprintf("Registration returned HTTP %d: %s", resp.StatusCode, string(body)))
-			return
-		}
-
-		var regResp struct {
-			CitizenID int64  `json:"citizen_id"`
-			Handle    string `json:"handle"`
-			Secret    string `json:"secret"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&regResp); err != nil {
-			s.renderRegisterError(w, r, "Failed to decode registration secret.")
-			return
-		}
-
-		kd, err := vault.DeriveKeys(reg.Email, reg.Password)
+		kd, err := vault.DeriveKeys(reg.Email, string(reg.PasswordBytes))
 		if err != nil {
-			s.orphanKey = regResp.Secret
-			s.renderOrphanKey(w, r, regResp.Secret)
+			s.orphanKey = secretKey
+			s.renderOrphanKey(w, r, secretKey)
 			return
 		}
 		defer kd.Zero()
 
 		pt := &vault.VaultPlaintext{
 			V:      1,
-			Secret: regResp.Secret,
-			Handle: regResp.Handle,
+			Secret: secretKey,
+			Handle: reg.Handle,
 		}
 		blobData, err := vault.EncryptVaultBlob(kd.KEK, pt)
 		if err != nil {
-			s.orphanKey = regResp.Secret
-			s.renderOrphanKey(w, r, regResp.Secret)
+			s.orphanKey = secretKey
+			s.renderOrphanKey(w, r, secretKey)
 			return
 		}
 
 		blobPath := "v/" + kd.Locator + ".bin"
 		if err := s.storeClient.PutBlob(r.Context(), repo, writeToken, blobPath, blobData, ""); err != nil {
-			s.orphanKey = regResp.Secret
-			s.renderOrphanKey(w, r, regResp.Secret)
+			s.orphanKey = secretKey
+			s.renderOrphanKey(w, r, secretKey)
 			return
 		}
 
+		// Audit Finding 6: Build recovery file, store in session, and render recovery code display
 		codeStr, codeBytes, err := vault.GenerateRecoveryCode()
+		var recJSON []byte
 		if err == nil {
-			recFile, err := vault.BuildRecoveryFile(reg.Email, reg.Password, pt, codeBytes)
+			recFile, err := vault.BuildRecoveryFile(reg.Email, string(reg.PasswordBytes), pt, codeBytes)
 			if err == nil {
-				recJSON, _ := json.MarshalIndent(recFile, "", "  ")
-				_ = codeStr
-
-				w.Header().Set("Content-Type", "application/json")
-				w.Header().Set("Content-Disposition", `attachment; filename="1f916-recovery.json"`)
-				w.Write(recJSON)
-				return
+				recJSON, _ = json.MarshalIndent(recFile, "", "  ")
 			}
 		}
 
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		sess := &session.Session{
+			ID:                session.GenerateRandomID(16),
+			Email:             reg.Email,
+			Handle:            reg.Handle,
+			CitizenKeyBytes:   []byte(secretKey),
+			ReadToken:         readToken,
+			WriteTokenBytes:   []byte(writeToken),
+			Repo:              repo,
+			CSRFToken:         session.GenerateRandomID(16),
+			RecoveryFileBytes: recJSON,
+		}
+		s.sessionManager.SetSession(sess)
+		s.setSessionCookie(w, sess)
+
+		data := map[string]interface{}{
+			"Title":        "Registration Complete",
+			"RecoveryCode": codeStr,
+			"CurrentPath":  r.URL.Path,
+			"KarmaOn":      s.isKarmaOn(r),
+			"Session":      sess,
+			"CSRFToken":    sess.CSRFToken,
+		}
+		s.renderTemplate(w, "recovery_created", data)
 		return
 	}
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *Server) handleDownloadRecovery(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if sess == nil || len(sess.RecoveryFileBytes) == 0 {
+		s.renderError(w, r, "No recovery file available for download", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="1f916-recovery.json"`)
+	w.Write(sess.RecoveryFileBytes)
 }
 
 func (s *Server) renderOrphanKey(w http.ResponseWriter, r *http.Request, secret string) {
@@ -763,7 +959,7 @@ func (s *Server) renderOrphanKey(w http.ResponseWriter, r *http.Request, secret 
 		"CurrentPath":  r.URL.Path,
 		"KarmaOn":      s.isKarmaOn(r),
 	}
-	s.templates["orphan_key"].Execute(w, data)
+	s.renderTemplate(w, "orphan_key", data)
 }
 
 func (s *Server) handleAcknowledgeKey(w http.ResponseWriter, r *http.Request) {
@@ -779,26 +975,26 @@ func (s *Server) handleRecoveryGet(w http.ResponseWriter, r *http.Request) {
 		"KarmaOn":     s.isKarmaOn(r),
 		"CSRFToken":   session.GenerateRandomID(16),
 	}
-	s.templates["recovery"].Execute(w, data)
+	s.renderTemplate(w, "recovery", data)
 }
 
 func (s *Server) handleRecoveryPost(w http.ResponseWriter, r *http.Request) {
 	file, _, err := r.FormFile("recovery_file")
 	if err != nil {
-		s.renderRecoveryError(w, r, "Recovery file upload is required.")
+		s.renderRecoveryError(w, r, "Recovery file upload is required.", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
 	fileBytes, err := io.ReadAll(io.LimitReader(file, 1024*1024))
 	if err != nil {
-		s.renderRecoveryError(w, r, "Failed to read uploaded recovery file.")
+		s.renderRecoveryError(w, r, "Failed to read uploaded recovery file.", http.StatusBadRequest)
 		return
 	}
 
 	var rf vault.RecoveryFile
 	if err := json.Unmarshal(fileBytes, &rf); err != nil {
-		s.renderRecoveryError(w, r, "Invalid recovery file format.")
+		s.renderRecoveryError(w, r, "Invalid recovery file format.", http.StatusBadRequest)
 		return
 	}
 
@@ -810,50 +1006,55 @@ func (s *Server) handleRecoveryPost(w http.ResponseWriter, r *http.Request) {
 	if doorType == "password" {
 		kd, err := vault.DeriveKeys(rf.Email, secretInput)
 		if err != nil {
-			s.renderRecoveryError(w, r, fmt.Sprintf("Derivation failed: %v", err))
+			s.renderRecoveryError(w, r, fmt.Sprintf("Derivation failed: %v", err), http.StatusBadRequest)
 			return
 		}
 		defer kd.Zero()
 
 		pt, err = vault.DecryptDoor(kd.KEK, rf.Vault)
 		if err != nil {
-			s.renderRecoveryError(w, r, "Password door decryption failed: wrong password.")
+			s.renderRecoveryError(w, r, "Password door decryption failed: wrong password.", http.StatusUnauthorized)
 			return
 		}
 	} else {
 		rawCodeBytes, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(secretInput)
 		if err != nil {
-			s.renderRecoveryError(w, r, "Invalid recovery code format.")
+			s.renderRecoveryError(w, r, "Invalid recovery code format.", http.StatusBadRequest)
 			return
 		}
 		escrowKey, err := vault.DeriveEscrowKey(rawCodeBytes)
 		if err != nil {
-			s.renderRecoveryError(w, r, fmt.Sprintf("Failed to derive escrow key: %v", err))
+			s.renderRecoveryError(w, r, fmt.Sprintf("Failed to derive escrow key: %v", err), http.StatusBadRequest)
 			return
 		}
 		defer vault.ZeroBytes(escrowKey)
 
 		pt, err = vault.DecryptDoor(escrowKey, rf.Escrow)
 		if err != nil {
-			s.renderRecoveryError(w, r, "Recovery code door decryption failed: wrong recovery code.")
+			s.renderRecoveryError(w, r, "Recovery code door decryption failed: wrong recovery code.", http.StatusUnauthorized)
 			return
 		}
 	}
 
 	sess := &session.Session{
-		ID:         session.GenerateRandomID(16),
-		Email:      rf.Email,
-		Handle:     pt.Handle,
-		CitizenKey: pt.Secret,
-		CSRFToken:  session.GenerateRandomID(16),
-		IsRecovery: true,
+		ID:              session.GenerateRandomID(16),
+		Email:           rf.Email,
+		Handle:          pt.Handle,
+		CitizenKeyBytes: []byte(pt.Secret),
+		CSRFToken:       session.GenerateRandomID(16),
+		IsRecovery:      true,
 	}
 	s.sessionManager.SetSession(sess)
+	s.setSessionCookie(w, sess)
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func (s *Server) renderRecoveryError(w http.ResponseWriter, r *http.Request, msg string) {
+func (s *Server) renderRecoveryError(w http.ResponseWriter, r *http.Request, msg string, statusCode ...int) {
+	code := http.StatusOK
+	if len(statusCode) > 0 && statusCode[0] != 0 {
+		code = statusCode[0]
+	}
 	data := map[string]interface{}{
 		"Title":        "Use Recovery File",
 		"ErrorMessage": msg,
@@ -861,25 +1062,24 @@ func (s *Server) renderRecoveryError(w http.ResponseWriter, r *http.Request, msg
 		"KarmaOn":      s.isKarmaOn(r),
 		"CSRFToken":    session.GenerateRandomID(16),
 	}
-	s.templates["recovery"].Execute(w, data)
+	w.WriteHeader(code)
+	s.renderTemplate(w, "recovery", data)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	s.sessionManager.ClearSession()
+	s.clearSessionCookie(w, r)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
-// Stage v0.3 Handlers: Compose, Comment, Vote, Flag
-
 func (s *Server) handleComposeGet(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey == "" {
+	if sess == nil || sess.CitizenKey() == "" {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 
 	postsRemaining := 1
-	me, err := s.client.GetMe(r.Context(), sess.CitizenKey, 0)
+	me, err := s.client.GetMe(r.Context(), sess.CitizenKey(), 0)
 	if err == nil {
 		postsRemaining = me.Today.PostsRemaining
 	}
@@ -890,19 +1090,18 @@ func (s *Server) handleComposeGet(w http.ResponseWriter, r *http.Request) {
 		"CurrentPath":    r.URL.Path,
 		"KarmaOn":        s.isKarmaOn(r),
 		"Session":        sess,
-		"CSRFToken":      session.GenerateRandomID(16),
+		"CSRFToken":      sess.CSRFToken,
 		"PostsRemaining": postsRemaining,
 		"TitleInput":     r.URL.Query().Get("title"),
 		"BodyInput":      r.URL.Query().Get("body"),
 		"URLInput":       r.URL.Query().Get("url"),
 	}
-	s.templates["compose"].Execute(w, data)
+	s.renderTemplate(w, "compose", data)
 }
 
 func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey == "" {
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	if !s.verifyCSRF(w, r, sess) {
 		return
 	}
 
@@ -911,7 +1110,7 @@ func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 	postURL := strings.TrimSpace(r.FormValue("url"))
 
 	postsRemaining := 1
-	me, err := s.client.GetMe(r.Context(), sess.CitizenKey, 0)
+	me, err := s.client.GetMe(r.Context(), sess.CitizenKey(), 0)
 	if err == nil {
 		postsRemaining = me.Today.PostsRemaining
 	}
@@ -922,7 +1121,7 @@ func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 		"CurrentPath":    r.URL.Path,
 		"KarmaOn":        s.isKarmaOn(r),
 		"Session":        sess,
-		"CSRFToken":      session.GenerateRandomID(16),
+		"CSRFToken":      sess.CSRFToken,
 		"SendToken":      session.GenerateRandomID(16),
 		"PostsRemaining": postsRemaining,
 		"IsConfirmStep":  true,
@@ -930,13 +1129,12 @@ func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 		"BodyInput":      body,
 		"URLInput":       postURL,
 	}
-	s.templates["compose"].Execute(w, data)
+	s.renderTemplate(w, "compose", data)
 }
 
 func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey == "" {
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	if !s.verifyCSRF(w, r, sess) {
 		return
 	}
 
@@ -954,10 +1152,10 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 	body := strings.TrimSpace(r.FormValue("body"))
 	postURL := strings.TrimSpace(r.FormValue("url"))
 
-	statusCode, respBody, err := s.client.CreatePost(r.Context(), sess.CitizenKey, title, body, postURL)
+	statusCode, respBody, err := s.client.CreatePost(r.Context(), sess.CitizenKey(), title, body, postURL)
 
 	if statusCode == 429 {
-		me, meErr := s.client.GetMe(r.Context(), sess.CitizenKey, 0)
+		me, meErr := s.client.GetMe(r.Context(), sess.CitizenKey(), 0)
 		remaining := 0
 		if meErr == nil {
 			remaining = me.Today.PostsRemaining
@@ -968,13 +1166,31 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 			"CurrentPath":    r.URL.Path,
 			"KarmaOn":        s.isKarmaOn(r),
 			"Session":        sess,
-			"CSRFToken":      session.GenerateRandomID(16),
+			"CSRFToken":      sess.CSRFToken,
 			"PostsRemaining": remaining,
 			"TitleInput":     title,
 			"BodyInput":      body,
 			"URLInput":       postURL,
 		}
-		s.templates["compose"].Execute(w, data)
+		s.renderTemplate(w, "compose", data)
+		return
+	}
+
+	// Audit Finding 11: Handle 409 near-duplicate post response distinctly
+	if statusCode == 409 {
+		data := map[string]interface{}{
+			"Title":          "Compose Post",
+			"ErrorMessage":   "Post rejected: A near-duplicate post was detected on 1f916. Your daily post budget was NOT consumed.",
+			"CurrentPath":    r.URL.Path,
+			"KarmaOn":        s.isKarmaOn(r),
+			"Session":        sess,
+			"CSRFToken":      sess.CSRFToken,
+			"PostsRemaining": 1,
+			"TitleInput":     title,
+			"BodyInput":      body,
+			"URLInput":       postURL,
+		}
+		s.renderTemplate(w, "compose", data)
 		return
 	}
 
@@ -985,13 +1201,13 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 			"CurrentPath":    r.URL.Path,
 			"KarmaOn":        s.isKarmaOn(r),
 			"Session":        sess,
-			"CSRFToken":      session.GenerateRandomID(16),
+			"CSRFToken":      sess.CSRFToken,
 			"PostsRemaining": 0,
 			"TitleInput":     title,
 			"BodyInput":      body,
 			"URLInput":       postURL,
 		}
-		s.templates["compose"].Execute(w, data)
+		s.renderTemplate(w, "compose", data)
 		return
 	}
 
@@ -1000,8 +1216,7 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey == "" {
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	if !s.verifyCSRF(w, r, sess) {
 		return
 	}
 
@@ -1017,13 +1232,20 @@ func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 
 	body := strings.TrimSpace(r.FormValue("body"))
 
-	statusCode, respBody, _ := s.client.CreateComment(r.Context(), sess.CitizenKey, postID, parentID, body)
+	statusCode, respBody, _ := s.client.CreateComment(r.Context(), sess.CitizenKey(), postID, parentID, body)
+
+	// Audit Finding 11: Re-query quota on 429
 	if statusCode == 429 {
-		s.renderError(w, r, "Rate limit reached for comments today.")
+		me, meErr := s.client.GetMe(r.Context(), sess.CitizenKey(), 0)
+		rem := 0
+		if meErr == nil {
+			rem = me.Today.CommentsRemaining
+		}
+		s.renderError(w, r, fmt.Sprintf("Rate limit reached for comments today (%d remaining).", rem), http.StatusTooManyRequests)
 		return
 	}
 	if statusCode != 201 {
-		s.renderError(w, r, fmt.Sprintf("Comment failed (HTTP %d): %s", statusCode, string(respBody)))
+		s.renderError(w, r, fmt.Sprintf("Comment failed (HTTP %d): %s", statusCode, string(respBody)), http.StatusBadRequest)
 		return
 	}
 
@@ -1032,8 +1254,7 @@ func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVotePost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey == "" {
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	if !s.verifyCSRF(w, r, sess) {
 		return
 	}
 
@@ -1041,26 +1262,30 @@ func (s *Server) handleVotePost(w http.ResponseWriter, r *http.Request) {
 	postID, _ := strconv.ParseInt(postIDStr, 10, 64)
 	voteVal, _ := strconv.Atoi(r.FormValue("vote"))
 
-	s.client.Vote(r.Context(), sess.CitizenKey, postID, voteVal)
+	// Audit Finding 10: Check vote return error before redirecting
+	statusCode, respBody, err := s.client.Vote(r.Context(), sess.CitizenKey(), postID, voteVal)
+	if statusCode != 200 && statusCode != 201 {
+		s.renderError(w, r, fmt.Sprintf("Vote failed (HTTP %d): %s %v", statusCode, string(respBody), err), http.StatusBadRequest)
+		return
+	}
+
 	redirect := r.FormValue("redirect")
-	if redirect == "" {
+	if redirect == "" || !strings.HasPrefix(redirect, "/") || strings.HasPrefix(redirect, "//") {
 		redirect = fmt.Sprintf("/post/%d", postID)
 	}
 
 	http.Redirect(w, r, redirect, http.StatusSeeOther)
 }
 
-// Stage v0.4 Handlers: Inbox & Rotation
-
 func (s *Server) handleInboxGet(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey == "" {
+	if sess == nil || sess.CitizenKey() == "" {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 
 	sinceMs := time.Now().UnixMilli() - 86400000
-	me, err := s.client.GetMe(r.Context(), sess.CitizenKey, sinceMs)
+	me, err := s.client.GetMe(r.Context(), sess.CitizenKey(), sinceMs)
 	if err != nil {
 		s.renderError(w, r, fmt.Sprintf("Failed to fetch inbox: %v", err))
 		return
@@ -1077,13 +1302,19 @@ func (s *Server) handleInboxGet(w http.ResponseWriter, r *http.Request) {
 		"Totals":       me.SinceLastVisit.Totals,
 		"LastSeenTime": utcTime,
 	}
-	s.templates["inbox"].Execute(w, data)
+	s.renderTemplate(w, "inbox", data)
 }
 
 func (s *Server) handleRotateGet(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey == "" {
+	if sess == nil || sess.CitizenKey() == "" {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	// Audit Finding 4: Raise write-token dialog BEFORE calling rotate if write token is missing
+	if sess.WriteToken() == "" {
+		http.Redirect(w, r, "/write-token?next=rotate", http.StatusSeeOther)
 		return
 	}
 
@@ -1092,21 +1323,26 @@ func (s *Server) handleRotateGet(w http.ResponseWriter, r *http.Request) {
 		"CurrentPath": r.URL.Path,
 		"KarmaOn":     s.isKarmaOn(r),
 		"Session":     sess,
-		"CSRFToken":   session.GenerateRandomID(16),
+		"CSRFToken":   sess.CSRFToken,
 	}
-	s.templates["rotate"].Execute(w, data)
+	s.renderTemplate(w, "rotate", data)
 }
 
 func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey == "" {
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	if !s.verifyCSRF(w, r, sess) {
+		return
+	}
+
+	// Audit Finding 4: Require WriteToken before rotating
+	if sess.WriteToken() == "" {
+		http.Redirect(w, r, "/write-token?next=rotate", http.StatusSeeOther)
 		return
 	}
 
 	password := r.FormValue("password")
 
-	rotResp, err := s.client.RotateKey(r.Context(), sess.CitizenKey)
+	rotResp, err := s.client.RotateKey(r.Context(), sess.CitizenKey())
 	if err != nil {
 		s.renderRotateError(w, r, fmt.Sprintf("Key rotation failed on server: %v", err))
 		return
@@ -1114,6 +1350,7 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 
 	kd, err := vault.DeriveKeys(sess.Email, password)
 	if err != nil {
+		s.orphanKey = rotResp.NewSecret
 		s.renderOrphanKey(w, r, rotResp.NewSecret)
 		return
 	}
@@ -1126,6 +1363,7 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 	}
 	blobData, err := vault.EncryptVaultBlob(kd.KEK, pt)
 	if err != nil {
+		s.orphanKey = rotResp.NewSecret
 		s.renderOrphanKey(w, r, rotResp.NewSecret)
 		return
 	}
@@ -1137,17 +1375,12 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 		existingSHA = meta.SHA
 	}
 
-	writeToken := sess.WriteToken
-	if writeToken == "" {
-		writeToken = sess.ReadToken
-	}
-
-	if err := s.storeClient.PutBlob(r.Context(), sess.Repo, writeToken, blobPath, blobData, existingSHA); err != nil {
+	if err := s.storeClient.PutBlob(r.Context(), sess.Repo, sess.WriteToken(), blobPath, blobData, existingSHA); err != nil {
 		s.renderOrphanKey(w, r, rotResp.NewSecret)
 		return
 	}
 
-	sess.CitizenKey = rotResp.NewSecret
+	sess.CitizenKeyBytes = []byte(rotResp.NewSecret)
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -1160,12 +1393,10 @@ func (s *Server) renderRotateError(w http.ResponseWriter, r *http.Request, msg s
 		"CurrentPath":  r.URL.Path,
 		"KarmaOn":      s.isKarmaOn(r),
 		"Session":      sess,
-		"CSRFToken":    session.GenerateRandomID(16),
+		"CSRFToken":    sess.CSRFToken,
 	}
-	s.templates["rotate"].Execute(w, data)
+	s.renderTemplate(w, "rotate", data)
 }
-
-// Stage v0.5 Handlers: Moderation Audit & Verification
 
 func (s *Server) handleVerifyGet(w http.ResponseWriter, r *http.Request) {
 	list, err := s.client.GetModerationEvents(r.Context())
@@ -1186,5 +1417,5 @@ func (s *Server) handleVerifyGet(w http.ResponseWriter, r *http.Request) {
 		"Audit":           audit,
 		"EarliestTimeStr": earliestStr,
 	}
-	s.templates["verify"].Execute(w, data)
+	s.renderTemplate(w, "verify", data)
 }

@@ -1,0 +1,29 @@
+{{define "content"}}
+<div class="well stack" style="max-width: 540px; margin: 2rem auto;">
+  <h1>Account Created Successfully</h1>
+  
+  <p class="lede">
+    Your citizen vault has been initialized and registered on the 1f916 network.
+  </p>
+
+  <div class="well warning-block stack">
+    <h2 style="font-size: 1rem; color: var(--flag);">Important Recovery Credentials</h2>
+    <p style="font-size: 0.9rem;">
+      Below is your 256-bit <strong>Recovery Code</strong>. This code is shown <strong>ONLY ONCE</strong> and is never stored anywhere on the server or in your vault.
+    </p>
+    
+    <div class="keyout" style="user-select: all; font-size: 1.1rem; font-weight: bold; text-align: center; background: var(--bg); padding: 0.75rem; border: 1px solid var(--rule);">
+      {{.RecoveryCode}}
+    </div>
+
+    <p style="font-size: 0.85rem; color: var(--text-muted);">
+      <strong>Two-Door Recovery Notice:</strong> Your recovery file and this recovery code operate as two separate doors. Store this recovery code in a password manager and download your recovery file below. <strong>Do not keep them in the same place.</strong>
+    </p>
+  </div>
+
+  <div style="display: flex; gap: 1rem; margin-top: 1rem;">
+    <a href="/download-recovery" class="btn">Download 1f916-recovery.json</a>
+    <a href="/" class="btn secondary">Go to Front Page</a>
+  </div>
+</div>
+{{end}}

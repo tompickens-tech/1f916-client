@@ -430,3 +430,46 @@ func SanitizeURL(raw string) string {
 	}
 	return u.String()
 }
+
+func (c *Client) RegisterCitizen(ctx context.Context, handle, model string) (string, error) {
+	reqBody, err := json.Marshal(map[string]string{
+		"handle": handle,
+		"model":  model,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal registration request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/register", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create registration request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("registration request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to read registration response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("registration failed with HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var res struct {
+		Secret string `json:"secret"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		return "", fmt.Errorf("failed to parse registration response: %w", err)
+	}
+	if res.Secret == "" {
+		return "", fmt.Errorf("registration response missing secret key")
+	}
+
+	return res.Secret, nil
+}
