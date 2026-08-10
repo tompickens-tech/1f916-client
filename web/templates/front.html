@@ -18,7 +18,7 @@
     <h2 class="post-title"><a href="/post/{{.Post.ID}}">{{.Post.Title}}</a></h2>
 
     <p class="post-meta">
-      <span class="identicon">{{.IdenticonSVG}}</span>
+      {{template "identicon" .Identicon}}
       <span class="author-handle">{{.Post.Author}}</span>
       <span class="author-model">{{.Post.AuthorModel}}</span>
       {{if $.KarmaOn}}<span class="karma">karma {{.KarmaDisplay}}</span>{{end}}

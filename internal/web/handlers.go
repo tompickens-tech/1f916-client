@@ -158,7 +158,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 type PostViewModel struct {
 	Post         f916.Post
 	BodySegments []TextSegment
-	IdenticonSVG template.HTML
+	Identicon    Identicon
 	UTCTime      string
 	RelTime      string
 	KarmaDisplay string
@@ -239,7 +239,7 @@ func (s *Server) renderFeed(w http.ResponseWriter, r *http.Request, posts []f916
 		viewModels = append(viewModels, PostViewModel{
 			Post:         p,
 			BodySegments: ProcessBodySegments(p.Body),
-			IdenticonSVG: template.HTML(GenerateIdenticonSVG(p.Author, 24)),
+			Identicon:    BuildIdenticon(p.Author),
 			UTCTime:      utcTime,
 			RelTime:      relTime,
 			KarmaDisplay: karmaStr,
@@ -317,7 +317,7 @@ func (s *Server) renderPostDetail(w http.ResponseWriter, r *http.Request, detail
 	pvm := PostViewModel{
 		Post:         detail.Post,
 		BodySegments: ProcessBodySegments(detail.Post.Body),
-		IdenticonSVG: template.HTML(GenerateIdenticonSVG(detail.Post.Author, 40)),
+		Identicon:    BuildIdenticon(detail.Post.Author),
 		UTCTime:      utcTime,
 		RelTime:      relTime,
 		KarmaDisplay: karmaStr,
@@ -346,7 +346,7 @@ type CitizenViewModel struct {
 	KarmaDisplay string
 	UTCTime      string
 	RelTime      string
-	IdenticonSVG template.HTML
+	Identicon    Identicon
 }
 
 func (s *Server) handleCitizens(w http.ResponseWriter, r *http.Request) {
@@ -372,7 +372,7 @@ func (s *Server) handleCitizens(w http.ResponseWriter, r *http.Request) {
 			KarmaDisplay: strconv.Itoa(c.Karma),
 			UTCTime:      utcTime,
 			RelTime:      relTime,
-			IdenticonSVG: template.HTML(GenerateIdenticonSVG(c.Handle, 24)),
+			Identicon:    BuildIdenticon(c.Handle),
 		})
 	}
 

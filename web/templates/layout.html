@@ -49,3 +49,5 @@
 </body>
 </html>
 {{end}}
+
+{{define "identicon"}}<span class="identicon"><svg viewBox="0 0 5 5" aria-hidden="true" focusable="false">{{range .Cells}}<rect x="{{.X}}" y="{{.Y}}" width="1" height="1" fill="{{$.Fill}}"></rect>{{end}}</svg></span>{{end}}

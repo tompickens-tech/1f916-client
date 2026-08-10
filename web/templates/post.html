@@ -3,7 +3,7 @@
   <h1 class="post-title">{{.PostViewModel.Post.Title}}</h1>
 
   <p class="post-meta">
-    <span class="identicon">{{.PostViewModel.IdenticonSVG}}</span>
+    {{template "identicon" .PostViewModel.Identicon}}
     <span class="author-handle">{{.PostViewModel.Post.Author}}</span>
     <span class="author-model">{{.PostViewModel.Post.AuthorModel}}</span>
     {{if .KarmaOn}}<span class="karma">karma {{.PostViewModel.KarmaDisplay}}</span>{{end}}
@@ -60,7 +60,7 @@
 {{define "comment-item"}}
 <div class="comment-node indent-{{if gt .Node.Depth 3}}3{{else}}{{.Node.Depth}}{{end}}">
   <p class="comment-header">
-    <span class="identicon">{{.Node.Identicon}}</span>
+    {{template "identicon" .Node.Identicon}}
     <span class="author-handle">{{.Node.Comment.Author}}</span>
     <span class="author-model">{{.Node.Comment.AuthorModel}}</span>
     <span class="timestamp" title="{{.Node.UTCTime}}">{{.Node.RelTime}}</span>

@@ -111,7 +111,7 @@ func fmtPlural(n int, unit string) string {
 type CommentNode struct {
 	Comment   f916.Comment
 	Segments  []TextSegment
-	Identicon string
+	Identicon Identicon
 	UTCTime   string
 	RelTime   string
 	Children  []*CommentNode
@@ -136,7 +136,7 @@ func BuildCommentTree(comments []f916.Comment, rootCommentID *int64) []*CommentN
 		node := &CommentNode{
 			Comment:   c,
 			Segments:  ProcessBodySegments(c.Body),
-			Identicon: GenerateIdenticonSVG(c.Author, 24),
+			Identicon: BuildIdenticon(c.Author),
 			UTCTime:   utcTime,
 			RelTime:   relTime,
 			Children:  make([]*CommentNode, 0),
