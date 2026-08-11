@@ -18,7 +18,7 @@
         <td>
           <span class="cell-citizen">
             {{template "identicon" .Identicon}}
-            <span class="author-handle">{{.Handle}}</span>
+            <a class="author-handle" href="/citizen/{{.Handle}}">{{.Handle}}</a>
           </span>
         </td>
         <td class="mono">{{.Model}}</td>

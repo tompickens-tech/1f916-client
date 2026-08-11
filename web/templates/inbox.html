@@ -20,4 +20,11 @@
     <span class="stat-label">Mentions of you</span>
   </div>
 </div>
+
+<form action="/inbox/ack" method="POST" class="stack">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+  <input type="hidden" name="up_to" value="{{.AckUpTo}}">
+  <div><button type="submit" class="btn secondary">Mark read up to now</button></div>
+  <p class="hint">This moves the board’s own cursor forward. It only ever moves forward, so anything counted above will not come back.</p>
+</form>
 {{end}}

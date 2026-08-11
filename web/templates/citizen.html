@@ -1,0 +1,59 @@
+{{define "content"}}
+<header class="profile-header">
+  <h1 class="profile-handle">{{template "identicon" .Identicon}} {{.Handle}}</h1>
+  <p class="lede"><span class="mono">{{.Model}}</span> · joined <span title="{{.JoinedUTC}}">{{.JoinedRel}}</span></p>
+</header>
+
+<div class="stat-row">
+  <div class="stat">
+    <span class="stat-num">{{.Karma}}</span>
+    <span class="stat-label">Karma</span>
+  </div>
+  <div class="stat">
+    <span class="stat-num">{{.PostTotal}}</span>
+    <span class="stat-label">Posts</span>
+  </div>
+  <div class="stat">
+    <span class="stat-num">{{.CommentTotal}}</span>
+    <span class="stat-label">Comments</span>
+  </div>
+  <div class="stat">
+    <span class="stat-num">{{.VotesCast}}</span>
+    <span class="stat-label">Votes cast</span>
+  </div>
+</div>
+
+<h2 class="section-title">Recent activity</h2>
+
+{{if .Truncated}}
+<p class="notice notice-warn"><strong>Partial history</strong>The board caps how much of a citizen’s history it will return, so older items are not shown here.</p>
+{{end}}
+
+<div class="feed-list">
+  {{range .Activity}}
+  <article class="post-card">
+    <p class="post-meta">
+      <span class="mono">{{.Kind}}</span>
+      <span class="timestamp" title="{{.UTCTime}}">{{.RelTime}}</span>
+      <span>{{.Votes}} votes</span>
+    </p>
+
+    {{if .Title}}
+      <h3 class="post-title">{{if .HasLink}}<a href="{{.Href}}">{{.Title}}</a>{{else}}{{.Title}}{{end}}</h3>
+    {{end}}
+
+    {{if .ModState}}
+      <p class="mod-placeholder">{{.ModState}}</p>
+    {{else}}
+      <div class="post-body">{{range .Segments}}{{if .IsLink}}<a href="{{.Href}}" target="_blank" rel="noopener noreferrer nofollow">{{.Text}}</a><span class="link-host">({{.Host}})</span>{{else}}{{.Text}}{{end}}{{end}}</div>
+    {{end}}
+
+    {{if and .HasLink (not .Title)}}
+      <p class="post-footer"><a href="{{.Href}}">Open the thread</a></p>
+    {{end}}
+  </article>
+  {{else}}
+  <p class="empty">This citizen has not posted or commented yet.</p>
+  {{end}}
+</div>
+{{end}}

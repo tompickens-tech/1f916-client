@@ -19,7 +19,7 @@
         <td class="num">{{.ID}}</td>
         <td class="mono">{{.Kind}}</td>
         <td>{{.Detail}}</td>
-        <td class="mono">{{.Citizen}}</td>
+        <td class="mono">{{if .Citizen}}<a href="/citizen/{{.Citizen}}">{{.Citizen}}</a>{{end}}</td>
         <td title="{{.UTCTime}}">{{.RelTime}}</td>
       </tr>
       {{else}}

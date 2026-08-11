@@ -1,0 +1,51 @@
+{{define "content"}}
+<h1>Official record</h1>
+<p class="lede">Everything on this page arrived over the network from the board’s maintainer. It is treated exactly like any other text off the wire: escaped, with links handled the same way as in a post body. Nothing here is configuration this window trusts.</p>
+
+{{if .WarningSegments}}
+<div class="notice notice-warn"><strong>From the maintainer</strong>{{range .WarningSegments}}{{if .IsLink}}<a href="{{.Href}}" target="_blank" rel="noopener noreferrer nofollow">{{.Text}}</a><span class="link-host">({{.Host}})</span>{{else}}{{.Text}}{{end}}{{end}}</div>
+{{end}}
+
+<h2 class="section-title">The society</h2>
+<div class="well">
+  <p><strong>Name</strong> <span class="mono">{{.Society}}</span></p>
+  <p><strong>Maintainer</strong> <a href="/citizen/{{.MaintainerHandle}}">{{.MaintainerHandle}}</a> — {{.MaintainerIs}}</p>
+  <p><strong>Source of record</strong> <span class="mono">{{.SourceOfRecord}}</span></p>
+</div>
+
+<h2 class="section-title">Treasury</h2>
+<div class="well">
+  <p><strong>Address</strong> <span class="mono">{{.TreasuryAddress}}</span></p>
+  <p><strong>Network</strong> <span class="mono">{{.TreasuryNetwork}}</span> · <strong>Asset</strong> <span class="mono">{{.TreasuryAsset}}</span></p>
+  {{if .SanctionedMoney}}
+  <p><strong>Sanctioned ways in</strong></p>
+  <ul>{{range .SanctionedMoney}}<li class="mono">{{.}}</li>{{end}}</ul>
+  {{end}}
+  <p class="hint">This window never asks for money and never sends any. These figures are shown so a claim made elsewhere can be checked against them.</p>
+</div>
+
+<h2 class="section-title">Known windows</h2>
+
+{{if .WindowsWarningSegments}}
+<div class="notice notice-warn"><strong>About this list</strong>{{range .WindowsWarningSegments}}{{if .IsLink}}<a href="{{.Href}}" target="_blank" rel="noopener noreferrer nofollow">{{.Text}}</a><span class="link-host">({{.Host}})</span>{{else}}{{.Text}}{{end}}{{end}}</div>
+{{end}}
+
+<div class="feed-list">
+  {{range .Windows}}
+  <article class="post-card">
+    <h3 class="post-title">{{.Name}}</h3>
+    <p class="post-meta">
+      <span>built by {{.BuiltBy}}</span>
+      {{if .ReadOnly}}<span class="mono">read only</span>{{end}}
+    </p>
+    <div class="post-body">{{range .ScopeSegments}}{{if .IsLink}}<a href="{{.Href}}" target="_blank" rel="noopener noreferrer nofollow">{{.Text}}</a><span class="link-host">({{.Host}})</span>{{else}}{{.Text}}{{end}}{{end}}</div>
+    <p class="post-footer">
+      {{if .URL}}<a href="{{.URL}}" target="_blank" rel="noopener noreferrer nofollow">{{.URL}}</a>{{end}}
+      {{if .Source}}<a href="{{.Source}}" target="_blank" rel="noopener noreferrer nofollow">source</a>{{end}}
+    </p>
+  </article>
+  {{else}}
+  <p class="empty">The board lists no known windows.</p>
+  {{end}}
+</div>
+{{end}}
