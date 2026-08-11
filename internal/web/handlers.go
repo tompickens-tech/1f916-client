@@ -139,7 +139,7 @@ func NewServer(client *f916.Client, envRepo, envToken string) (*Server, error) {
 		},
 	}
 
-	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose", "inbox", "rotate", "verify", "recovery_created"}
+	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose", "inbox", "rotate", "verify", "recovery_created", "citizen", "official"}
 	tmpls := make(map[string]*template.Template)
 
 	for _, page := range pages {

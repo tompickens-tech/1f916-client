@@ -1,5 +1,3 @@
-# 06 — Audit: what the shipped code gets wrong
-
 Audit of `tompickens06-tech/1f916-client` at `main`, 10 Aug 2026. Covers registration, login, posting, and comment posting end to end. **The most serious finding is that any process on the machine can act as the logged-in citizen with a single unauthenticated request.**
 
 ## Re-audit — 10 Aug 2026, midday
@@ -274,6 +272,85 @@ Confirm on that same bare container that `/recovery` still works. It is the one 
 Two older findings fall out of this work and should be ticked off rather than left open: **2**, because the render helper removes the fifteen independently invented tokens, and **3**, because the `1f916_reg` cookie gives each registration its own key and its own expiry.
 
 Of the concurrency cluster, **19** and **20** are implied by the sweeper and the lock-ordering rule but are not named; **8** — `ReadToken` still an unzeroable `string` — has no home in this plan at all. Name all three in the commit, or say plainly that 8 waits for a later pass. An unnamed fix is one nobody can verify.
+
+## Phase 1 review — commit `e694829`, 11 Aug
+
+Read at `e694829c8cbb0395c1ab561b8b7daa2c3252bc74`. Three files: `cmd/client/main.go` (+4 −1), `internal/session/session.go` (+78 −8), `internal/web/handlers.go` (+325 −141). **No template was changed and no file was added.**
+
+Seven of the nine claims hold up, and one unclaimed finding was fixed as well. Three problems came in with them, and two of the three block Phase 2.
+
+### Blocking 1 — nothing compiled or ran this
+
+The working log contains `git diff`, a series of reads, one edit, and `git commit -am … && git push`. No `go build`. No `go test`. That matters more than usual here, because this commit **changed the shape of a struct that other files use**:
+
+- `Session.ReadToken` went from a `string` field to a `ReadToken()` method. Every `sess.ReadToken` read elsewhere in the tree must have gained parentheses.
+- `Session.CSRFToken` was **deleted outright**. Every remaining reference is a compile error.
+- `web.NewServer` gained two parameters.
+
+`internal/session/session_test.go` was opened during the work and **not modified**, so if it touches either field the package does not build. `git commit -am` also stages only tracked files, so any new file this phase needed — a sweeper test, for instance — was silently left behind.
+
+**Before anything else: `go build ./... && go test ./...`.** A push is not evidence that the code compiles.
+
+### Blocking 2 — a nil session now dereferences instead of being rejected
+
+`verifyCSRF` lost its session parameter. That parameter was doing a second job nobody wrote down: the old signature returned false when `sess == nil`, which meant every handler that called it was accidentally guarded against a missing session.
+
+That guard is gone, and the handlers were not given a replacement:
+
+```go
+func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
+    sess := s.getSession(r)
+    if !s.verifyCSRF(w, r) {
+        return
+    }
+    if sess.Repo == "" || sess.WriteToken() == "" {   // sess may be nil
+```
+
+The CSRF cookie has no expiry and the session is swept after thirty minutes, so this is not exotic: leave a tab open over lunch, come back, submit the form. `net/http` recovers the panic, so the result is a 500 and a stack trace rather than a dead process — but it is a crash on the most ordinary sequence a user can perform.
+
+`handleRotatePost` is confirmed. **Every handler that calls `verifyCSRF` and then touches `sess` needs an explicit nil check**, and the sensible place is one at the top of each POST handler.
+
+### Blocking 3 — `resolveRepo` puts the environment above the live session
+
+```go
+if formRepo != "" { return formRepo, true }
+if s.envRepo  != "" { return s.envRepo, true }      // wins over the session
+if sess != nil && sess.Repo != "" { return sess.Repo, true }
+```
+
+On a container started with `VAULT_REPO=A`, someone who types repository **B** on the login screen gets a session whose `Repo` is B — but `handleWriteTokenGet` and `handleWriteTokenPost` both resolve through this function and get **A**. So the write token is probed against A, `CheckIsNewStore` runs against A and seeds decoys there, while `handleRotatePost` reads `sess.Repo` directly and writes the vault to B.
+
+The permission check and the write land on different repositories. **Correct order is form, then session, then pending registration, then environment** — the environment is a default, not an override.
+
+### Worth checking, not blocking
+
+- `(s *Server) sweeper()` exists and expires pending registrations at fifteen minutes, but the constructor fragment does not visibly start it. Confirm `go s.sweeper()` is called in `NewServer`, or the expiry is dead code. It also has no stop channel, unlike the session sweeper.
+- Rotation re-reads from `main` rather than at the SHA returned by `PutBlob`. A stale read returns the **old** blob, whose secret will not match, so it fails towards the orphan-key screen — the safe direction, but a needless scare. One retry keyed on the returned SHA would remove it.
+- The fresh recovery-file export that rotation is supposed to produce is still absent.
+- `1f916_csrf` is a double-submit cookie with no binding to a session, so a local process can fetch a cookie and then use it — two requests instead of one. Local processes are already an accepted threat, so this is acceptable, but it should not be described as making the client safe against anything on the machine.
+
+### Credit where it is due
+
+- **Finding 23 was fixed without being claimed.** `handleRotateGet` now renders `s.getSessionView(sess)` instead of the whole struct — which also removes the hazard of handing a struct containing a live mutex to `html/template`.
+- **A rejected write token no longer destroys the pending registration.** The probe-failure paths re-render the dialog and leave the record intact, so a mistyped token is now recoverable.
+- **Rotation genuinely verifies.** `PutBlob` → `GetBlob` → decrypt → compare the secret → and only then assign to the session. The ordering detail that mattered most was honoured.
+- **`SweepOnce()` exported is a better answer than the injectable clock I asked for.** A test can backdate `LastActive` and call it directly. Same result, less machinery.
+- Lock ordering is manager-then-session in all five manager methods, `verifyCSRF` has no fallback, `1f916_reg` is its own cookie, and the orphan-key map is not swept.
+
+### Phase 1.5 — commit `0e32aa4`, verified
+
+All three blockers are resolved. Verified from the **commit diff**, not from the file: `raw.githubusercontent.com` served a stale copy of `handlers.go` after the push, still showing the pre-fix text, while `api.github.com/…/commits/0e32aa4` showed the real change. **After a fresh push, read the commit patch through the API and trust that; the raw endpoint lags and will make a landed fix look missing.**
+
+- `resolveRepo` is now form → session → pending registration → environment. `resolveReadToken` was reordered the same way without being asked.
+- The nil-session guard went into exactly five handlers: compose preview, compose publish, comment, vote, rotate. **It was correctly kept off `/login`, `/register`, `/recovery`, `/write-token` and `/acknowledge-key`**, all of which run before a session exists. A literal reading of "every POST handler" would have broken registration outright; that trap was avoided.
+- `go s.sweeper()` is called at the end of `NewServer`, so the fifteen-minute pending-registration expiry is live.
+
+Four things still to settle:
+
+- **`handleLogout` was never audited.** It is registered for both `GET` and `POST` and has the same shape as the five that were fixed. Clicking log out on a tab left open past the idle sweep is exactly as likely as the rotate case. Check it, and every `GET` handler that dereferences the session.
+- **The build was verified on the wrong Go version.** The Dockerfile pins `golang:1.23-alpine`; verification ran on `golang:1.25-alpine`. Code that compiles on 1.25 can fail on 1.23. Verify on the image the Dockerfile pins, or move the pin deliberately.
+- **`-race` was never run and there is still no concurrency test.** Finding 20 is asserted, not demonstrated.
+- `task.md` was written after `git commit -am`, which stages only tracked files, so it is almost certainly untracked and unpushed.
 
 ## What is right, and worth not breaking
 
