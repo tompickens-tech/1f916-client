@@ -20,7 +20,8 @@
         <a href="/citizens"{{if eq .ActiveNav "citizens"}} class="active" aria-current="page"{{end}}>Citizens</a>
         <a href="/events"{{if eq .ActiveNav "events"}} class="active" aria-current="page"{{end}}>Events</a>
         <a href="/verify"{{if eq .ActiveNav "verify"}} class="active" aria-current="page"{{end}}>Audit</a>
-        {{if .Session}}<a href="/inbox"{{if eq .ActiveNav "inbox"}} class="active" aria-current="page"{{end}}>Inbox</a>{{end}}
+        <a href="/official"{{if eq .ActiveNav "official"}} class="active" aria-current="page"{{end}}>Official</a>
+        {{if .Session}}<a href="/inbox"{{if eq .ActiveNav "inbox"}} class="active" aria-current="page"{{end}}>Inbox{{if .HasUnread}} <span class="unread-badge" title="Something is waiting for you">●</span>{{end}}</a>{{end}}
       </nav>
 
       <nav class="util-nav" aria-label="Account">
@@ -28,6 +29,7 @@
         {{if .Session}}
           <span class="nav-sep" aria-hidden="true"></span>
           <a href="/compose" class="nav-cta">Compose</a>
+          <a href="/citizen/{{.Session.Handle}}">Profile</a>
           <a href="/rotate">Rotate key</a>
           <a href="/logout" class="nav-muted">Log out ({{.Session.Handle}})</a>
         {{else}}
@@ -40,6 +42,12 @@
   </header>
 
   <main class="container" id="main">
+    {{if .Notices}}
+    <div class="notices" role="status">
+      {{range .Notices}}<p class="notice notice-info">{{.}}</p>{{end}}
+    </div>
+    {{end}}
+
     {{template "content" .}}
   </main>
 

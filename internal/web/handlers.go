@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/json"
@@ -24,6 +25,16 @@ import (
 	webassets "github.com/tompickens06-tech/1f916-client/web"
 )
 
+const (
+	// pulseMaxAge is how long an unread answer is trusted before the next
+	// page asks the board again. Cheap enough that no handler needs to be
+	// selective about calling it.
+	pulseMaxAge = 1 * time.Minute
+	// pulseBudget is the whole time a pulse may take. It gets its OWN child
+	// context, never one the page's real fetch then reuses.
+	pulseBudget = 2 * time.Second
+)
+
 type Server struct {
 	client         *f916.Client
 	storeClient    *store.Client
@@ -43,6 +54,10 @@ type Server struct {
 
 	sentTokensMutex sync.Mutex
 	usedSendTokens  map[string]bool
+
+	// pagingLogOnce keeps the "has_more with no cursor" raw dump to one line
+	// per process instead of one per page view.
+	pagingLogOnce sync.Once
 
 	logger *log.Logger
 }
@@ -139,7 +154,7 @@ func NewServer(client *f916.Client, envRepo, envToken string) (*Server, error) {
 		},
 	}
 
-	pages := []string{"front", "post", "citizens", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose", "inbox", "rotate", "verify", "recovery_created", "citizen", "official"}
+	pages := []string{"front", "post", "citizens", "citizen", "official", "events", "error", "login", "register", "recovery", "orphan_key", "write_token", "compose", "inbox", "rotate", "verify", "recovery_created"}
 	tmpls := make(map[string]*template.Template)
 
 	for _, page := range pages {
@@ -202,8 +217,8 @@ func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 }
 
 type SessionView struct {
-	Handle    string
-	Email     string
+	Handle string
+	Email  string
 }
 
 func (s *Server) getSessionView(sess *session.Session) *SessionView {
@@ -343,6 +358,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /post/{id}", s.handlePost)
 	mux.HandleFunc("GET /post/{id}/thread/{comment_id}", s.handleThread)
 	mux.HandleFunc("GET /citizens", s.handleCitizens)
+	mux.HandleFunc("GET /citizen/{handle}", s.handleCitizenProfile)
+	mux.HandleFunc("GET /official", s.handleOfficial)
 	mux.HandleFunc("GET /events", s.handleEvents)
 	mux.HandleFunc("GET /toggle-karma", s.handleToggleKarma)
 
@@ -367,6 +384,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /vote", s.handleVotePost)
 
 	mux.HandleFunc("GET /inbox", s.handleInboxGet)
+	mux.HandleFunc("POST /inbox/ack", s.handleInboxAck)
 	mux.HandleFunc("GET /rotate", s.handleRotateGet)
 	mux.HandleFunc("POST /rotate", s.handleRotatePost)
 	mux.HandleFunc("GET /verify", s.handleVerifyGet)
@@ -390,9 +408,59 @@ type PostViewModel struct {
 	KarmaDisplay string
 }
 
+// CommentRefusal is the draft the door refused, handed back to the author with
+// their thread context intact.
+type CommentRefusal struct {
+	Message  string
+	Body     string
+	ParentID string
+}
+
 func (s *Server) isKarmaOn(r *http.Request) bool {
 	cookie, err := r.Cookie("karma")
 	return err == nil && cookie.Value == "on"
+}
+
+// refreshPulse updates the unread badge for a signed-in citizen.
+//
+// The badge lives in the shared layout, so it appears on every page. Rather
+// than enumerating handlers by hand and leaving one off, every handler that
+// renders the layout builds its data through baseData, and baseData calls
+// this. The one-minute cache makes it nearly free.
+func (s *Server) refreshPulse(r *http.Request, sess *session.Session) {
+	if !sess.HasKey() {
+		return
+	}
+	// BeginPulse writes LastPulseCheck before releasing the lock, so two
+	// simultaneous requests cannot both read a stale timestamp and both fetch.
+	if !sess.BeginPulse(pulseMaxAge) {
+		return
+	}
+	// Its own child context: a slow pulse must not eat the page's real fetch.
+	ctx, cancel := context.WithTimeout(r.Context(), pulseBudget)
+	defer cancel()
+
+	pulse, err := s.client.GetPulse(ctx, sess.CitizenKey())
+	if err != nil {
+		s.logger.Printf("pulse check failed (badge left as it was): %v", err)
+		return
+	}
+	sess.SetUnread(pulse.AnythingWaiting())
+}
+
+// baseData builds the fields the shared layout needs, and refreshes the pulse
+// on the way past. Every layout-rendering handler goes through here.
+func (s *Server) baseData(w http.ResponseWriter, r *http.Request, sess *session.Session, title, activeNav string) map[string]interface{} {
+	s.refreshPulse(r, sess)
+	return map[string]interface{}{
+		"Title":       title,
+		"ActiveNav":   activeNav,
+		"CurrentPath": r.URL.Path,
+		"KarmaOn":     s.isKarmaOn(r),
+		"Session":     s.getSessionView(sess),
+		"HasUnread":   sess.HasUnread(),
+		"CSRFToken":   s.getCSRFToken(w, r),
+	}
 }
 
 func (s *Server) renderError(w http.ResponseWriter, r *http.Request, msg string, statusCode ...int) {
@@ -407,25 +475,57 @@ func (s *Server) renderError(w http.ResponseWriter, r *http.Request, msg string,
 		"KarmaOn":      s.isKarmaOn(r),
 		"ActiveNav":    "",
 	}
+	// An error page does not consume the author's flash notices: they are
+	// neither shown nor cleared here, so the next good page still carries them.
 	s.renderTemplate(w, "error", data, code)
 }
 
-func (s *Server) renderTemplate(w http.ResponseWriter, name string, data interface{}, statusCode ...int) {
+// renderPage renders a layout page and only then clears the flash notices.
+//
+// Order matters: read the value, render the whole page into the buffer, and
+// only once the buffer is good take the lock and clear it. Popping first means
+// a template error swallows the one message the author needed.
+func (s *Server) renderPage(w http.ResponseWriter, sess *session.Session, name string, data map[string]interface{}, statusCode ...int) {
+	notices := sess.PeekNotices()
+	data["Notices"] = notices
+	if !s.renderTemplate(w, name, data, statusCode...) {
+		return
+	}
+	if len(notices) > 0 {
+		sess.ClearNotices()
+	}
+}
+
+// renderTemplate renders into a buffer first and reports whether the page was
+// actually written.
+func (s *Server) renderTemplate(w http.ResponseWriter, name string, data interface{}, statusCode ...int) bool {
 	tmpl, ok := s.templates[name]
 	if !ok {
 		http.Error(w, "Template not found", http.StatusInternalServerError)
-		return
+		return false
 	}
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {
 		s.logger.Printf("Template execution error (%s): %v", name, err)
 		http.Error(w, "Internal Server Error rendering template", http.StatusInternalServerError)
-		return
+		return false
 	}
 	if len(statusCode) > 0 && statusCode[0] != 0 {
 		w.WriteHeader(statusCode[0])
 	}
 	_, _ = buf.WriteTo(w)
+	return true
+}
+
+// releaseSendToken puts a one-shot send token back into play. Used on the
+// refusal path so the author's retry is not swallowed by the dedupe.
+func (s *Server) releaseSendToken(token string) {
+	if token == "" {
+		return
+	}
+	s.sentTokensMutex.Lock()
+	delete(s.usedSendTokens, token)
+	s.sentTokensMutex.Unlock()
 }
 
 func (s *Server) handleFront(w http.ResponseWriter, r *http.Request) {
@@ -493,16 +593,11 @@ func (s *Server) renderFeed(w http.ResponseWriter, r *http.Request, posts []f916
 		})
 	}
 
-	data := map[string]interface{}{
-		"Title":       title,
-		"ActiveNav":   activeNav,
-		"Posts":       viewModels,
-		"KarmaOn":     karmaOn,
-		"CurrentPath": r.URL.Path,
-		"Session":     s.getSessionView(s.getSession(r)),
-	}
+	sess := s.getSession(r)
+	data := s.baseData(w, r, sess, title, activeNav)
+	data["Posts"] = viewModels
 
-	s.renderTemplate(w, "front", data)
+	s.renderPage(w, sess, "front", data)
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
@@ -513,13 +608,20 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	detail, err := s.client.GetPost(r.Context(), id)
+	var since *int64
+	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
+		if v, err := strconv.ParseInt(sinceStr, 10, 64); err == nil {
+			since = &v
+		}
+	}
+
+	detail, err := s.client.GetPostSince(r.Context(), id, since)
 	if err != nil {
 		s.renderError(w, r, err.Error())
 		return
 	}
 
-	s.renderPostDetail(w, r, detail, nil)
+	s.renderPostDetail(w, r, detail, nil, nil)
 }
 
 func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
@@ -543,10 +645,10 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.renderPostDetail(w, r, detail, &commentID)
+	s.renderPostDetail(w, r, detail, &commentID, nil)
 }
 
-func (s *Server) renderPostDetail(w http.ResponseWriter, r *http.Request, detail *f916.PostDetail, rootCommentID *int64) {
+func (s *Server) renderPostDetail(w http.ResponseWriter, r *http.Request, detail *f916.PostDetail, rootCommentID *int64, refusal *CommentRefusal) {
 	karmaOn := s.isKarmaOn(r)
 	var karmaMap map[string]int
 	if karmaOn {
@@ -572,21 +674,39 @@ func (s *Server) renderPostDetail(w http.ResponseWriter, r *http.Request, detail
 
 	commentNodes := BuildCommentTree(detail.Comments, rootCommentID)
 
-	sess := s.getSession(r)
-
-	data := map[string]interface{}{
-		"Title":         detail.Post.Title,
-		"ActiveNav":     "",
-		"PostViewModel": pvm,
-		"CommentNodes":  commentNodes,
-		"KarmaOn":       karmaOn,
-		"KarmaMap":      karmaMap,
-		"CurrentPath":   r.URL.Path,
-		"Session":       s.getSessionView(sess),
-		"CSRFToken":     s.getCSRFToken(w, r),
+	// Comment paging: say what is being shown, and offer the next page when
+	// the board handed back a cursor. When it says there is more but gives no
+	// cursor, say so plainly and dump the raw answer once.
+	nextURL := ""
+	pagingUnavailable := false
+	if detail.HasMore {
+		if cursor := detail.Cursor(); cursor != nil {
+			nextURL = fmt.Sprintf("/post/%d?since=%d", detail.Post.ID, *cursor)
+		} else {
+			pagingUnavailable = true
+			s.pagingLogOnce.Do(func() {
+				raw := string(detail.Raw)
+				if len(raw) > 4096 {
+					raw = raw[:4096] + "…(truncated)"
+				}
+				s.logger.Printf("comment paging: has_more was true but no cursor was returned; raw response: %s", raw)
+			})
+		}
 	}
 
-	s.renderTemplate(w, "post", data)
+	sess := s.getSession(r)
+	data := s.baseData(w, r, sess, detail.Post.Title, "")
+	data["PostViewModel"] = pvm
+	data["CommentNodes"] = commentNodes
+	data["KarmaMap"] = karmaMap
+	data["Refusal"] = refusal
+	data["CommentsTotal"] = detail.CommentsTotal
+	data["CommentsReturned"] = detail.CommentsReturned
+	data["CommentsNote"] = detail.CommentsNote
+	data["CommentsNextURL"] = nextURL
+	data["CommentsPagingUnavailable"] = pagingUnavailable
+
+	s.renderPage(w, sess, "post", data)
 }
 
 type CitizenViewModel struct {
@@ -625,19 +745,14 @@ func (s *Server) handleCitizens(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	data := map[string]interface{}{
-		"Title":       "Citizens",
-		"ActiveNav":   "citizens",
-		"Citizens":    viewModels,
-		"Total":       list.Total,
-		"HasMore":     list.HasMore,
-		"NextSince":   list.NextSince,
-		"KarmaOn":     s.isKarmaOn(r),
-		"CurrentPath": r.URL.Path,
-		"Session":     s.getSessionView(s.getSession(r)),
-	}
+	sess := s.getSession(r)
+	data := s.baseData(w, r, sess, "Citizens", "citizens")
+	data["Citizens"] = viewModels
+	data["Total"] = list.Total
+	data["HasMore"] = list.HasMore
+	data["NextSince"] = list.NextSince
 
-	s.renderTemplate(w, "citizens", data)
+	s.renderPage(w, sess, "citizens", data)
 }
 
 type EventViewModel struct {
@@ -669,16 +784,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	data := map[string]interface{}{
-		"Title":       "Moderation Events",
-		"ActiveNav":   "events",
-		"Events":      viewModels,
-		"KarmaOn":     s.isKarmaOn(r),
-		"CurrentPath": r.URL.Path,
-		"Session":     s.getSessionView(s.getSession(r)),
-	}
+	sess := s.getSession(r)
+	data := s.baseData(w, r, sess, "Moderation Events", "events")
+	data["Events"] = viewModels
 
-	s.renderTemplate(w, "events", data)
+	s.renderPage(w, sess, "events", data)
 }
 
 func (s *Server) handleToggleKarma(w http.ResponseWriter, r *http.Request) {
@@ -706,19 +816,7 @@ func (s *Server) handleToggleKarma(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLoginGet(w http.ResponseWriter, r *http.Request) {
-	envRepo := os.Getenv("VAULT_REPO")
-	envToken := os.Getenv("VAULT_TOKEN")
-
-	data := map[string]interface{}{
-		"Title":              "Log In",
-		"ActiveNav":          "",
-		"CurrentPath":        r.URL.Path,
-		"KarmaOn":            s.isKarmaOn(r),
-		"EnvRepoConfigured":  envRepo != "",
-		"EnvTokenConfigured": envToken != "",
-		"CSRFToken": s.getCSRFToken(w, r),
-	}
-	s.renderTemplate(w, "login", data)
+	s.renderLoginError(w, r, "")
 }
 
 func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
@@ -797,35 +895,18 @@ func (s *Server) renderLoginError(w http.ResponseWriter, r *http.Request, msg st
 	if len(statusCode) > 0 && statusCode[0] != 0 {
 		code = statusCode[0]
 	}
-	envRepo := os.Getenv("VAULT_REPO")
-	envToken := os.Getenv("VAULT_TOKEN")
-
-	data := map[string]interface{}{
-		"Title":              "Log In",
-		"ErrorMessage":       msg,
-		"CurrentPath":        r.URL.Path,
-		"KarmaOn":            s.isKarmaOn(r),
-		"EnvRepoConfigured":  envRepo != "",
-		"EnvTokenConfigured": envToken != "",
-		"CSRFToken": s.getCSRFToken(w, r),
+	sess := s.getSession(r)
+	data := s.baseData(w, r, sess, "Log In", "")
+	if msg != "" {
+		data["ErrorMessage"] = msg
 	}
-	s.renderTemplate(w, "login", data, code)
+	data["EnvRepoConfigured"] = os.Getenv("VAULT_REPO") != ""
+	data["EnvTokenConfigured"] = os.Getenv("VAULT_TOKEN") != ""
+	s.renderPage(w, sess, "login", data, code)
 }
 
 func (s *Server) handleRegisterGet(w http.ResponseWriter, r *http.Request) {
-	envRepo := os.Getenv("VAULT_REPO")
-	envToken := os.Getenv("VAULT_TOKEN")
-
-	data := map[string]interface{}{
-		"Title":              "Register Citizen",
-		"ActiveNav":          "",
-		"CurrentPath":        r.URL.Path,
-		"KarmaOn":            s.isKarmaOn(r),
-		"EnvRepoConfigured":  envRepo != "",
-		"EnvTokenConfigured": envToken != "",
-		"CSRFToken":          s.getCSRFToken(w, r),
-	}
-	s.renderTemplate(w, "register", data)
+	s.renderRegisterError(w, r, "")
 }
 
 func (s *Server) clearPendingReg(w http.ResponseWriter, r *http.Request) {
@@ -873,7 +954,7 @@ func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	defer kd.Zero()
 
 	s.clearPendingReg(w, r)
-	
+
 	regToken := session.GenerateRandomID(16)
 	s.setRegCookie(w, regToken)
 
@@ -896,24 +977,19 @@ func (s *Server) renderRegisterError(w http.ResponseWriter, r *http.Request, msg
 	if len(statusCode) > 0 && statusCode[0] != 0 {
 		code = statusCode[0]
 	}
-	envRepo := os.Getenv("VAULT_REPO")
-	envToken := os.Getenv("VAULT_TOKEN")
-
-	data := map[string]interface{}{
-		"Title":              "Register Citizen",
-		"ErrorMessage":       msg,
-		"CurrentPath":        r.URL.Path,
-		"KarmaOn":            s.isKarmaOn(r),
-		"EnvRepoConfigured":  envRepo != "",
-		"EnvTokenConfigured": envToken != "",
-		"CSRFToken":          s.getCSRFToken(w, r),
+	sess := s.getSession(r)
+	data := s.baseData(w, r, sess, "Register Citizen", "")
+	if msg != "" {
+		data["ErrorMessage"] = msg
 	}
-	s.renderTemplate(w, "register", data, code)
+	data["EnvRepoConfigured"] = os.Getenv("VAULT_REPO") != ""
+	data["EnvTokenConfigured"] = os.Getenv("VAULT_TOKEN") != ""
+	s.renderPage(w, sess, "register", data, code)
 }
 
 func (s *Server) handleWriteTokenGet(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	
+
 	var reg *PendingRegistration
 	regToken := s.getRegCookie(r)
 	if regToken != "" {
@@ -923,17 +999,11 @@ func (s *Server) handleWriteTokenGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	repo, _ := s.resolveRepo(sess, reg, "")
-	nextAction := r.URL.Query().Get("next")
 
-	data := map[string]interface{}{
-		"Title":       "GitHub Write Token",
-		"Repo":        repo,
-		"NextAction":  nextAction,
-		"CurrentPath": r.URL.Path,
-		"KarmaOn":     s.isKarmaOn(r),
-		"CSRFToken": s.getCSRFToken(w, r),
-	}
-	s.renderTemplate(w, "write_token", data)
+	data := s.baseData(w, r, sess, "GitHub Write Token", "")
+	data["Repo"] = repo
+	data["NextAction"] = r.URL.Query().Get("next")
+	s.renderPage(w, sess, "write_token", data)
 }
 
 func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
@@ -943,9 +1013,9 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 
 	writeToken := strings.TrimSpace(r.FormValue("write_token"))
 	nextAction := r.FormValue("next_action")
-	
+
 	sess := s.getSession(r)
-	
+
 	var reg *PendingRegistration
 	regToken := s.getRegCookie(r)
 	if regToken != "" {
@@ -956,32 +1026,22 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 
 	repo, _ := s.resolveRepo(sess, reg, "")
 
+	renderTokenError := func(msg string) {
+		data := s.baseData(w, r, sess, "GitHub Write Token", "")
+		data["ErrorMessage"] = msg
+		data["Repo"] = repo
+		data["NextAction"] = nextAction
+		s.renderPage(w, sess, "write_token", data)
+	}
+
 	probe, err := s.storeClient.ProbeRepo(r.Context(), repo, writeToken)
 	if err != nil {
-		data := map[string]interface{}{
-			"Title":        "GitHub Write Token",
-			"ErrorMessage": fmt.Sprintf("Write token check failed: %v", err),
-			"Repo":         repo,
-			"NextAction":   nextAction,
-			"CurrentPath":  r.URL.Path,
-			"KarmaOn":      s.isKarmaOn(r),
-			"CSRFToken": s.getCSRFToken(w, r),
-		}
-		s.renderTemplate(w, "write_token", data)
+		renderTokenError(fmt.Sprintf("Write token check failed: %v", err))
 		return
 	}
 
 	if !probe.Permissions.Push {
-		data := map[string]interface{}{
-			"Title":        "GitHub Write Token",
-			"ErrorMessage": "This token can read your vault but not change it. You need one with Contents: Read and write.",
-			"Repo":         repo,
-			"NextAction":   nextAction,
-			"CurrentPath":  r.URL.Path,
-			"KarmaOn":      s.isKarmaOn(r),
-			"CSRFToken": s.getCSRFToken(w, r),
-		}
-		s.renderTemplate(w, "write_token", data)
+		renderTokenError("This token can read your vault but not change it. You need one with Contents: Read and write.")
 		return
 	}
 
@@ -1063,7 +1123,7 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			readToken = writeToken
 		}
 
-		sess := &session.Session{
+		newSess := &session.Session{
 			ID:                session.GenerateRandomID(16),
 			Email:             reg.Email,
 			Handle:            reg.Handle,
@@ -1073,18 +1133,12 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			Repo:              repo,
 			RecoveryFileBytes: recJSON,
 		}
-		s.sessionManager.SetSession(sess)
-		s.setSessionCookie(w, sess)
+		s.sessionManager.SetSession(newSess)
+		s.setSessionCookie(w, newSess)
 
-		data := map[string]interface{}{
-			"Title":        "Registration Complete",
-			"RecoveryCode": codeStr,
-			"CurrentPath":  r.URL.Path,
-			"KarmaOn":      s.isKarmaOn(r),
-			"Session":     s.getSessionView(sess),
-			"CSRFToken": s.getCSRFToken(w, r),
-		}
-		s.renderTemplate(w, "recovery_created", data)
+		data := s.baseData(w, r, newSess, "Registration Complete", "")
+		data["RecoveryCode"] = codeStr
+		s.renderPage(w, newSess, "recovery_created", data)
 		return
 	}
 
@@ -1113,14 +1167,10 @@ func (s *Server) renderOrphanKey(w http.ResponseWriter, r *http.Request, secret 
 	s.orphanKeys[regToken] = secret
 	s.orphanMu.Unlock()
 
-	data := map[string]interface{}{
-		"Title":        "Raw Secret Key",
-		"RawSecretKey": secret,
-		"CSRFToken":    s.getCSRFToken(w, r),
-		"CurrentPath":  r.URL.Path,
-		"KarmaOn":      s.isKarmaOn(r),
-	}
-	s.renderTemplate(w, "orphan_key", data)
+	sess := s.getSession(r)
+	data := s.baseData(w, r, sess, "Raw Secret Key", "")
+	data["RawSecretKey"] = secret
+	s.renderPage(w, sess, "orphan_key", data)
 }
 
 func (s *Server) handleAcknowledgeKey(w http.ResponseWriter, r *http.Request) {
@@ -1135,14 +1185,7 @@ func (s *Server) handleAcknowledgeKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRecoveryGet(w http.ResponseWriter, r *http.Request) {
-	data := map[string]interface{}{
-		"Title":       "Use Recovery File",
-		"ActiveNav":   "",
-		"CurrentPath": r.URL.Path,
-		"KarmaOn":     s.isKarmaOn(r),
-		"CSRFToken": s.getCSRFToken(w, r),
-	}
-	s.renderTemplate(w, "recovery", data)
+	s.renderRecoveryError(w, r, "")
 }
 
 func (s *Server) handleRecoveryPost(w http.ResponseWriter, r *http.Request) {
@@ -1221,14 +1264,12 @@ func (s *Server) renderRecoveryError(w http.ResponseWriter, r *http.Request, msg
 	if len(statusCode) > 0 && statusCode[0] != 0 {
 		code = statusCode[0]
 	}
-	data := map[string]interface{}{
-		"Title":        "Use Recovery File",
-		"ErrorMessage": msg,
-		"CurrentPath":  r.URL.Path,
-		"KarmaOn":      s.isKarmaOn(r),
-		"CSRFToken": s.getCSRFToken(w, r),
+	sess := s.getSession(r)
+	data := s.baseData(w, r, sess, "Use Recovery File", "")
+	if msg != "" {
+		data["ErrorMessage"] = msg
 	}
-	s.renderTemplate(w, "recovery", data, code)
+	s.renderPage(w, sess, "recovery", data, code)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -1236,37 +1277,36 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
+// composeData builds the compose page's data, including the live daily budget.
+func (s *Server) composeData(w http.ResponseWriter, r *http.Request, sess *session.Session, title, titleInput, bodyInput, urlInput string) map[string]interface{} {
+	postsRemaining := 0
+	if me, err := s.client.GetMe(r.Context(), sess.CitizenKey(), 0); err == nil {
+		postsRemaining = me.Today.PostsRemaining
+	}
+
+	data := s.baseData(w, r, sess, title, "")
+	data["PostsRemaining"] = postsRemaining
+	data["TitleInput"] = titleInput
+	data["BodyInput"] = bodyInput
+	data["URLInput"] = urlInput
+	return data
+}
+
 func (s *Server) handleComposeGet(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey() == "" {
+	if !sess.HasKey() {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 
-	postsRemaining := 1
-	me, err := s.client.GetMe(r.Context(), sess.CitizenKey(), 0)
-	if err == nil {
-		postsRemaining = me.Today.PostsRemaining
-	}
-
-	data := map[string]interface{}{
-		"Title":          "Compose Post",
-		"ActiveNav":      "",
-		"CurrentPath":    r.URL.Path,
-		"KarmaOn":        s.isKarmaOn(r),
-		"Session":     s.getSessionView(sess),
-		"CSRFToken": s.getCSRFToken(w, r),
-		"PostsRemaining": postsRemaining,
-		"TitleInput":     r.URL.Query().Get("title"),
-		"BodyInput":      r.URL.Query().Get("body"),
-		"URLInput":       r.URL.Query().Get("url"),
-	}
-	s.renderTemplate(w, "compose", data)
+	data := s.composeData(w, r, sess, "Compose Post",
+		r.URL.Query().Get("title"), r.URL.Query().Get("body"), r.URL.Query().Get("url"))
+	s.renderPage(w, sess, "compose", data)
 }
 
 func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey() == "" {
+	if !sess.HasKey() {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
@@ -1278,32 +1318,15 @@ func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 	body := strings.TrimSpace(r.FormValue("body"))
 	postURL := strings.TrimSpace(r.FormValue("url"))
 
-	postsRemaining := 1
-	me, err := s.client.GetMe(r.Context(), sess.CitizenKey(), 0)
-	if err == nil {
-		postsRemaining = me.Today.PostsRemaining
-	}
-
-	data := map[string]interface{}{
-		"Title":          "Review Post",
-		"ActiveNav":      "",
-		"CurrentPath":    r.URL.Path,
-		"KarmaOn":        s.isKarmaOn(r),
-		"Session":     s.getSessionView(sess),
-		"CSRFToken": s.getCSRFToken(w, r),
-		"SendToken":      session.GenerateRandomID(16),
-		"PostsRemaining": postsRemaining,
-		"IsConfirmStep":  true,
-		"TitleInput":     title,
-		"BodyInput":      body,
-		"URLInput":       postURL,
-	}
-	s.renderTemplate(w, "compose", data)
+	data := s.composeData(w, r, sess, "Review Post", title, body, postURL)
+	data["SendToken"] = session.GenerateRandomID(16)
+	data["IsConfirmStep"] = true
+	s.renderPage(w, sess, "compose", data)
 }
 
 func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey() == "" {
+	if !sess.HasKey() {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
@@ -1324,72 +1347,64 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 	title := strings.TrimSpace(r.FormValue("title"))
 	body := strings.TrimSpace(r.FormValue("body"))
 	postURL := strings.TrimSpace(r.FormValue("url"))
+	hygieneOverride := r.FormValue("hygiene_override") == "1"
 
-	statusCode, respBody, err := s.client.CreatePost(r.Context(), sess.CitizenKey(), title, body, postURL)
+	statusCode, respBody, err := s.client.CreatePostOverride(r.Context(), sess.CitizenKey(), title, body, postURL, hygieneOverride)
+
+	// 422: the door refused this write. The draft comes back intact, the send
+	// token is released so the retry is not swallowed, and the daily count is
+	// untouched because the gate runs before the board counts anything.
+	if statusCode == 422 {
+		s.releaseSendToken(sendToken)
+		data := s.composeData(w, r, sess, "Compose Post", title, body, postURL)
+		data["SendToken"] = sendToken
+		data["Refusal"] = &CommentRefusal{Message: f916.RefusalMessage(respBody), Body: body}
+		s.renderPage(w, sess, "compose", data)
+		return
+	}
 
 	if statusCode == 429 {
-		me, meErr := s.client.GetMe(r.Context(), sess.CitizenKey(), 0)
-		remaining := 0
-		if meErr == nil {
-			remaining = me.Today.PostsRemaining
-		}
-		data := map[string]interface{}{
-			"Title":          "Compose Post",
-			"ErrorMessage":   fmt.Sprintf("Rate limit reached on 1f916 board. Posts remaining today: %d", remaining),
-			"CurrentPath":    r.URL.Path,
-			"KarmaOn":        s.isKarmaOn(r),
-			"Session":     s.getSessionView(sess),
-			"CSRFToken": s.getCSRFToken(w, r),
-			"PostsRemaining": remaining,
-			"TitleInput":     title,
-			"BodyInput":      body,
-			"URLInput":       postURL,
-		}
-		s.renderTemplate(w, "compose", data)
+		data := s.composeData(w, r, sess, "Compose Post", title, body, postURL)
+		data["ErrorMessage"] = "Rate limit reached on the 1f916 board. One post per citizen per UTC day."
+		s.renderPage(w, sess, "compose", data)
 		return
 	}
 
 	// Audit Finding 11: Handle 409 near-duplicate post response distinctly
 	if statusCode == 409 {
-		data := map[string]interface{}{
-			"Title":          "Compose Post",
-			"ErrorMessage":   "Post rejected: A near-duplicate post was detected on 1f916. Your daily post budget was NOT consumed.",
-			"CurrentPath":    r.URL.Path,
-			"KarmaOn":        s.isKarmaOn(r),
-			"Session":     s.getSessionView(sess),
-			"CSRFToken": s.getCSRFToken(w, r),
-			"PostsRemaining": 1,
-			"TitleInput":     title,
-			"BodyInput":      body,
-			"URLInput":       postURL,
-		}
-		s.renderTemplate(w, "compose", data)
+		s.releaseSendToken(sendToken)
+		data := s.composeData(w, r, sess, "Compose Post", title, body, postURL)
+		data["ErrorMessage"] = "Post rejected: a near-duplicate post was detected on 1f916. Your daily post budget was NOT consumed."
+		s.renderPage(w, sess, "compose", data)
 		return
 	}
 
 	if statusCode != 201 {
-		data := map[string]interface{}{
-			"Title":          "Compose Post",
-			"ErrorMessage":   fmt.Sprintf("Post failed (HTTP %d): %s %v", statusCode, string(respBody), err),
-			"CurrentPath":    r.URL.Path,
-			"KarmaOn":        s.isKarmaOn(r),
-			"Session":     s.getSessionView(sess),
-			"CSRFToken": s.getCSRFToken(w, r),
-			"PostsRemaining": 0,
-			"TitleInput":     title,
-			"BodyInput":      body,
-			"URLInput":       postURL,
-		}
-		s.renderTemplate(w, "compose", data)
+		data := s.composeData(w, r, sess, "Compose Post", title, body, postURL)
+		data["ErrorMessage"] = fmt.Sprintf("Post failed (HTTP %d): %s %v", statusCode, string(respBody), err)
+		s.renderPage(w, sess, "compose", data)
 		return
 	}
 
+	// 201. Everything the board wants the author to know is in this receipt and
+	// nowhere else, so it is carried to the next page as a flash notice.
+	receipt := f916.ParseReceipt(respBody)
+	notices := receipt.NoticeLines()
+	if len(notices) == 0 {
+		notices = []string{"Published."}
+	}
+	sess.SetNotices(notices)
+
+	if receipt.PostID > 0 {
+		http.Redirect(w, r, fmt.Sprintf("/post/%d", receipt.PostID), http.StatusSeeOther)
+		return
+	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey() == "" {
+	if !sess.HasKey() {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
@@ -1400,16 +1415,34 @@ func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 	postIDStr := r.FormValue("post_id")
 	postID, _ := strconv.ParseInt(postIDStr, 10, 64)
 
+	parentStr := r.FormValue("parent_id")
 	var parentID *int64
-	if parentStr := r.FormValue("parent_id"); parentStr != "" {
+	if parentStr != "" {
 		if pVal, err := strconv.ParseInt(parentStr, 10, 64); err == nil {
 			parentID = &pVal
 		}
 	}
 
 	body := strings.TrimSpace(r.FormValue("body"))
+	hygieneOverride := r.FormValue("hygiene_override") == "1"
 
-	statusCode, respBody, _ := s.client.CreateComment(r.Context(), sess.CitizenKey(), postID, parentID, body)
+	statusCode, respBody, _ := s.client.CreateCommentOverride(r.Context(), sess.CitizenKey(), postID, parentID, body, hygieneOverride)
+
+	// 422: re-render the thread the author was reading, with their draft in an
+	// inline refusal form that carries its own CSRF token.
+	if statusCode == 422 {
+		detail, derr := s.client.GetPost(r.Context(), postID)
+		if derr != nil {
+			s.renderError(w, r, fmt.Sprintf("The door refused this comment, and the thread could not be reloaded: %v", derr))
+			return
+		}
+		s.renderPostDetail(w, r, detail, nil, &CommentRefusal{
+			Message:  f916.RefusalMessage(respBody),
+			Body:     body,
+			ParentID: parentStr,
+		})
+		return
+	}
 
 	// Audit Finding 11: Re-query quota on 429
 	if statusCode == 429 {
@@ -1426,12 +1459,17 @@ func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	receipt := f916.ParseReceipt(respBody)
+	if notices := receipt.NoticeLines(); len(notices) > 0 {
+		sess.SetNotices(notices)
+	}
+
 	http.Redirect(w, r, fmt.Sprintf("/post/%d", postID), http.StatusSeeOther)
 }
 
 func (s *Server) handleVotePost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey() == "" {
+	if !sess.HasKey() {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
@@ -1443,16 +1481,25 @@ func (s *Server) handleVotePost(w http.ResponseWriter, r *http.Request) {
 	postID, _ := strconv.ParseInt(postIDStr, 10, 64)
 	voteVal, _ := strconv.Atoi(r.FormValue("vote"))
 
-	// Audit Finding 10: Check vote return error before redirecting
-	statusCode, respBody, err := s.client.Vote(r.Context(), sess.CitizenKey(), postID, voteVal)
-	if statusCode != 200 && statusCode != 201 {
-		s.renderError(w, r, fmt.Sprintf("Vote failed (HTTP %d): %s %v", statusCode, string(respBody), err), http.StatusBadRequest)
-		return
-	}
-
 	redirect := r.FormValue("redirect")
 	if redirect == "" || !strings.HasPrefix(redirect, "/") || strings.HasPrefix(redirect, "//") {
 		redirect = fmt.Sprintf("/post/%d", postID)
+	}
+
+	// Audit Finding 10: Check vote return error before redirecting
+	statusCode, respBody, err := s.client.Vote(r.Context(), sess.CitizenKey(), postID, voteVal)
+
+	// A duplicate vote changes nothing and is not an error. Say so quietly
+	// rather than rendering success, which reads as a bug.
+	if statusCode == 409 {
+		sess.SetNotices([]string{"You have already voted on this."})
+		http.Redirect(w, r, redirect, http.StatusSeeOther)
+		return
+	}
+
+	if statusCode != 200 && statusCode != 201 {
+		s.renderError(w, r, fmt.Sprintf("Vote failed (HTTP %d): %s %v", statusCode, string(respBody), err), http.StatusBadRequest)
+		return
 	}
 
 	http.Redirect(w, r, redirect, http.StatusSeeOther)
@@ -1460,7 +1507,7 @@ func (s *Server) handleVotePost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInboxGet(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey() == "" {
+	if !sess.HasKey() {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
@@ -1474,21 +1521,48 @@ func (s *Server) handleInboxGet(w http.ResponseWriter, r *http.Request) {
 
 	utcTime, _ := FormatUTCAndRelative(sinceMs)
 
-	data := map[string]interface{}{
-		"Title":        "Inbox",
-		"ActiveNav":    "inbox",
-		"CurrentPath":  r.URL.Path,
-		"KarmaOn":      s.isKarmaOn(r),
-		"Session":     s.getSessionView(sess),
-		"Totals":       me.SinceLastVisit.Totals,
-		"LastSeenTime": utcTime,
+	data := s.baseData(w, r, sess, "Inbox", "inbox")
+	data["Totals"] = me.SinceLastVisit.Totals
+	data["LastSeenTime"] = utcTime
+	data["AckUpTo"] = time.Now().UnixMilli()
+	s.renderPage(w, sess, "inbox", data)
+}
+
+// handleInboxAck moves the board's inbox cursor forward. Citizen key only: it
+// never touches the vault, so it can never raise a GitHub token dialog.
+func (s *Server) handleInboxAck(w http.ResponseWriter, r *http.Request) {
+	sess := s.getSession(r)
+	if !sess.HasKey() {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
 	}
-	s.renderTemplate(w, "inbox", data)
+	if !s.verifyCSRF(w, r) {
+		return
+	}
+
+	upTo, err := strconv.ParseInt(r.FormValue("up_to"), 10, 64)
+	if err != nil || upTo <= 0 {
+		upTo = time.Now().UnixMilli()
+	}
+
+	statusCode, respBody, ackErr := s.client.AckInbox(r.Context(), sess.CitizenKey(), upTo)
+	if ackErr != nil {
+		s.renderError(w, r, fmt.Sprintf("Mark read failed: %v", ackErr))
+		return
+	}
+	if statusCode < 200 || statusCode > 299 {
+		s.renderError(w, r, fmt.Sprintf("Mark read failed (HTTP %d): %s", statusCode, string(respBody)), http.StatusBadGateway)
+		return
+	}
+
+	sess.SetUnread(false)
+	sess.SetNotices([]string{"Inbox marked read up to now. The cursor only moves forward."})
+	http.Redirect(w, r, "/inbox", http.StatusSeeOther)
 }
 
 func (s *Server) handleRotateGet(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey() == "" {
+	if !sess.HasKey() {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
@@ -1499,19 +1573,13 @@ func (s *Server) handleRotateGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data := map[string]interface{}{
-		"Title":       "Rotate Secret Key",
-		"CurrentPath": r.URL.Path,
-		"KarmaOn":     s.isKarmaOn(r),
-		"Session":     s.getSessionView(sess),
-		"CSRFToken": s.getCSRFToken(w, r),
-	}
-	s.renderTemplate(w, "rotate", data)
+	data := s.baseData(w, r, sess, "Rotate Secret Key", "")
+	s.renderPage(w, sess, "rotate", data)
 }
 
 func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if sess == nil || sess.CitizenKey() == "" {
+	if !sess.HasKey() {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
@@ -1586,20 +1654,15 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 	sess.CitizenKeyBytes = []byte(rotResp.NewSecret)
 	sess.Mu.Unlock()
 
+	sess.SetNotices([]string{"Your key was rotated and the new one was read back out of the vault."})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) renderRotateError(w http.ResponseWriter, r *http.Request, msg string) {
 	sess := s.getSession(r)
-	data := map[string]interface{}{
-		"Title":        "Rotate Secret Key",
-		"ErrorMessage": msg,
-		"CurrentPath":  r.URL.Path,
-		"KarmaOn":      s.isKarmaOn(r),
-		"Session":     s.getSessionView(sess),
-		"CSRFToken": s.getCSRFToken(w, r),
-	}
-	s.renderTemplate(w, "rotate", data)
+	data := s.baseData(w, r, sess, "Rotate Secret Key", "")
+	data["ErrorMessage"] = msg
+	s.renderPage(w, sess, "rotate", data)
 }
 
 func (s *Server) handleVerifyGet(w http.ResponseWriter, r *http.Request) {
@@ -1612,14 +1675,10 @@ func (s *Server) handleVerifyGet(w http.ResponseWriter, r *http.Request) {
 	audit := f916.AuditModerationChain(list.Events)
 	earliestStr, _ := FormatUTCAndRelative(audit.EarliestTime)
 
-	data := map[string]interface{}{
-		"Title":           "Verify Moderation Audit",
-		"ActiveNav":       "",
-		"CurrentPath":     r.URL.Path,
-		"KarmaOn":         s.isKarmaOn(r),
-		"Session":     s.getSessionView(s.getSession(r)),
-		"Audit":           audit,
-		"EarliestTimeStr": earliestStr,
-	}
-	s.renderTemplate(w, "verify", data)
+	sess := s.getSession(r)
+	data := s.baseData(w, r, sess, "Verify Moderation Audit", "verify")
+	data["Audit"] = audit
+	data["EarliestTimeStr"] = earliestStr
+
+	s.renderPage(w, sess, "verify", data)
 }
