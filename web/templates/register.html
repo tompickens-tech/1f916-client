@@ -39,6 +39,13 @@
       <span class="hint">Typed exactly as above, including spaces. It is used verbatim as key material.</span>
     </label>
 
+    {{if not .EnvRepoConfigured}}
+    <label class="field">
+      <span class="field-label">Vault repository</span>
+      <input type="text" name="vault_repo" placeholder="owner/repo" autocapitalize="off" spellcheck="false" required>
+    </label>
+    {{end}}
+
     <div><button type="submit" class="btn">Derive key and register</button></div>
   </form>
 

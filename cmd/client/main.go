@@ -46,6 +46,9 @@ func main() {
 		f916Base = "https://1f916.ai"
 	}
 
+	envRepo := os.Getenv("VAULT_REPO")
+	envToken := os.Getenv("VAULT_TOKEN")
+
 	logLevel := os.Getenv("LOG_LEVEL")
 	if logLevel == "" {
 		logLevel = "info"
@@ -64,7 +67,7 @@ func main() {
 	}
 
 	f916Client := f916.NewClient(f916Base)
-	webServer, err := web.NewServer(f916Client)
+	webServer, err := web.NewServer(f916Client, envRepo, envToken)
 	if err != nil {
 		log.Fatalf("Failed to initialize web server: %v", err)
 	}

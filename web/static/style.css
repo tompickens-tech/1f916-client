@@ -15,73 +15,79 @@
 
 /* --- 1. Tokens ---------------------------------------------------------- */
 
+
 :root {
   color-scheme: light dark;
-
-  /* Ground. Warm, so it is not mistaken for a default template. */
-  --paper:      #fbfaf7;
-  --sunk:       #f2f0ea;
-  --raised:     #ffffff;
-
+  
+  /* Modern Vibrant Colors */
+  --paper: #f0f2f5;
+  --sunk: #e4e6eb;
+  --raised: rgba(255, 255, 255, 0.7);
+  
   /* Ink */
-  --ink:        #17160f;
-  --ink-2:      #54514a;
-  --ink-3:      #86816f;
-
+  --ink: #1c1e21;
+  --ink-2: #606770;
+  --ink-3: #8d949e;
+  
   /* Rules */
-  --rule:       #d8d4c9;
-  --rule-soft:  #e9e6dd;
-  --rule-firm:  #b3ae9f;
-
-  /* Signal. State only, never decoration. */
-  --link:       #14418c;
-  --link-visit: #5a3a86;
-  --flag:       #8b2f1b;
-  --flag-bg:    #f7ece8;
-  --hold:       #6a5910;
-  --hold-bg:    #f8f3de;
-  --ok:         #23532c;
-  --ok-bg:      #eaf1e9;
-
+  --rule: rgba(0, 0, 0, 0.1);
+  --rule-soft: rgba(0, 0, 0, 0.05);
+  --rule-firm: rgba(0, 0, 0, 0.2);
+  
+  /* Signal */
+  --link: #1877f2;
+  --link-visit: #7b4ee4;
+  --flag: #e41e3f;
+  --flag-bg: rgba(228, 30, 63, 0.1);
+  --hold: #f5a623;
+  --hold-bg: rgba(245, 166, 35, 0.1);
+  --ok: #31a24c;
+  --ok-bg: rgba(49, 162, 76, 0.1);
+  
   /* Type */
-  --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --sans: 'Inter', ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-
-  /* Spacing. 4px grid. Seven values, and that is all there is. */
-  --s1:  4px;
-  --s2:  8px;
-  --s3:  12px;
-  --s4:  16px;
-  --s6:  24px;
-  --s8:  32px;
+  
+  /* Spacing */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s6: 24px;
+  --s8: 32px;
   --s12: 48px;
-
-  /* Measure. 40rem is roughly 72 characters at this size. */
+  
   --measure: 40rem;
-  --page:    62rem;
+  --page: 64rem;
+  
+  /* Gradients */
+  --bg-gradient: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --paper:      #14140f;
-    --sunk:       #1c1b16;
-    --raised:     #1c1b16;
-    --ink:        #eceadf;
-    --ink-2:      #b3afa0;
-    --ink-3:      #85806f;
-    --rule:       #35332b;
-    --rule-soft:  #262520;
-    --rule-firm:  #4c493e;
-    --link:       #93b4e8;
-    --link-visit: #c0a8dd;
-    --flag:       #e39280;
-    --flag-bg:    #2b1a15;
-    --hold:       #d8c273;
-    --hold-bg:    #2a2415;
-    --ok:         #9dc4a2;
-    --ok-bg:      #182118;
+    --paper: #18191a;
+    --sunk: #242526;
+    --raised: rgba(36, 37, 38, 0.7);
+    --ink: #e4e6eb;
+    --ink-2: #b0b3b8;
+    --ink-3: #8a8d91;
+    --rule: rgba(255, 255, 255, 0.1);
+    --rule-soft: rgba(255, 255, 255, 0.05);
+    --rule-firm: rgba(255, 255, 255, 0.2);
+    --link: #4facfe;
+    --link-visit: #a18cd1;
+    --flag: #fa5c7c;
+    --flag-bg: rgba(250, 92, 124, 0.15);
+    --hold: #ffce67;
+    --hold-bg: rgba(255, 206, 103, 0.15);
+    --ok: #0acf97;
+    --ok-bg: rgba(10, 207, 151, 0.15);
+    
+    --bg-gradient: linear-gradient(135deg, #1f1c2c 0%, #928dab 100%);
   }
 }
+
 
 /* --- 2. Base ------------------------------------------------------------ */
 
@@ -97,13 +103,22 @@ html {
 
 body {
   margin: 0;
-  background: var(--paper);
+  background: var(--bg-gradient);
+  background-size: 200% 200%;
+  animation: gradientBG 15s ease infinite;
   color: var(--ink);
   font-family: var(--sans);
   font-size: 16px;
   line-height: 1.55;
   font-variant-numeric: tabular-nums;
 }
+
+@keyframes gradientBG {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
 
 h1,
 h2,
@@ -170,7 +185,15 @@ svg {
 
 .app-header {
   border-bottom: 1px solid var(--rule);
-  background: var(--paper);
+  
+  background: var(--raised);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--rule-soft);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+
 }
 
 .header-container {
@@ -476,10 +499,23 @@ svg {
 }
 
 .post-body {
-  max-width: var(--measure);
+  margin: 0;
+  background: var(--bg-gradient);
+  background-size: 200% 200%;
+  animation: gradientBG 15s ease infinite;
   color: var(--ink);
-  overflow-wrap: break-word;
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.55;
+  font-variant-numeric: tabular-nums;
 }
+
+@keyframes gradientBG {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
 
 .post-body a {
   overflow-wrap: anywhere;
@@ -1049,11 +1085,49 @@ textarea:focus {
   }
 
   body {
-    background: #fff;
-    color: #000;
-  }
+  margin: 0;
+  background: var(--bg-gradient);
+  background-size: 200% 200%;
+  animation: gradientBG 15s ease infinite;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.55;
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes gradientBG {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
 
   .post-card {
     break-inside: avoid;
   }
+}
+
+.post-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 10px 15px rgba(0, 0, 0, 0.1);
+}
+
+.btn {
+  transition: all 0.2s ease !important;
+  border-radius: 8px !important;
+  font-weight: 500 !important;
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.brand {
+  transition: color 0.2s ease;
+}
+
+.brand:hover {
+  color: var(--link);
 }

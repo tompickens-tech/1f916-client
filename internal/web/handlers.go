@@ -29,13 +29,22 @@ type Server struct {
 	storeClient    *store.Client
 	sessionManager *session.Manager
 	templates      map[string]*template.Template
-	orphanKey      string
-	pendingReg     *PendingRegistration
-	pendingMu      sync.Mutex
-	loginLimiter   *LoginLimiter
+
+	envRepo  string
+	envToken string
+
+	orphanKeys map[string]string
+	orphanMu   sync.Mutex
+
+	pendingRegs map[string]*PendingRegistration
+	pendingMu   sync.Mutex
+
+	loginLimiter *LoginLimiter
 
 	sentTokensMutex sync.Mutex
 	usedSendTokens  map[string]bool
+
+	logger *log.Logger
 }
 
 type PendingRegistration struct {
@@ -43,6 +52,7 @@ type PendingRegistration struct {
 	Model         string
 	Email         string
 	PasswordBytes []byte
+	Repo          string
 	CreatedAt     time.Time
 }
 
@@ -50,6 +60,21 @@ func (p *PendingRegistration) ZeroSecrets() {
 	if len(p.PasswordBytes) > 0 {
 		vault.ZeroBytes(p.PasswordBytes)
 		p.PasswordBytes = nil
+	}
+}
+
+func (s *Server) sweeper() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.pendingMu.Lock()
+		for token, reg := range s.pendingRegs {
+			if time.Since(reg.CreatedAt) > 15*time.Minute {
+				reg.ZeroSecrets()
+				delete(s.pendingRegs, token)
+			}
+		}
+		s.pendingMu.Unlock()
 	}
 }
 
@@ -70,12 +95,12 @@ func (l *LoginLimiter) CheckAllowed(ip string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if lockUntil, ok := l.locked[ip]; ok {
-		if time.Now().Before(lockUntil) {
-			return fmt.Errorf("too many failed login attempts. Please try again after %s", time.Until(lockUntil).Round(time.Second))
+	if unlockTime, ok := l.locked[ip]; ok {
+		if time.Now().Before(unlockTime) {
+			return fmt.Errorf("Account locked. Try again in %v", time.Until(unlockTime).Round(time.Second))
 		}
 		delete(l.locked, ip)
-		delete(l.attempts, ip)
+		l.attempts[ip] = 0
 	}
 	return nil
 }
@@ -83,22 +108,20 @@ func (l *LoginLimiter) CheckAllowed(ip string) error {
 func (l *LoginLimiter) RecordFailure(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
 	l.attempts[ip]++
 	if l.attempts[ip] >= 5 {
-		l.locked[ip] = time.Now().Add(15 * time.Minute)
+		l.locked[ip] = time.Now().Add(5 * time.Minute)
 	}
 }
 
 func (l *LoginLimiter) RecordSuccess(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	delete(l.attempts, ip)
+	l.attempts[ip] = 0
 	delete(l.locked, ip)
 }
 
-func NewServer(client *f916.Client) (*Server, error) {
+func NewServer(client *f916.Client, envRepo, envToken string) (*Server, error) {
 	tmplFuncs := template.FuncMap{
 		"dict": func(values ...interface{}) (map[string]interface{}, error) {
 			if len(values)%2 != 0 {
@@ -127,14 +150,21 @@ func NewServer(client *f916.Client) (*Server, error) {
 		tmpls[page] = t
 	}
 
-	return &Server{
+	s := &Server{
 		client:         client,
 		storeClient:    store.NewClient(),
 		sessionManager: session.NewManager(),
 		templates:      tmpls,
+		envRepo:        envRepo,
+		envToken:       envToken,
+		orphanKeys:     make(map[string]string),
+		pendingRegs:    make(map[string]*PendingRegistration),
 		loginLimiter:   NewLoginLimiter(),
 		usedSendTokens: make(map[string]bool),
-	}, nil
+		logger:         log.New(os.Stderr, "[web] ", log.LstdFlags),
+	}
+	go s.sweeper()
+	return s, nil
 }
 
 func (s *Server) getSession(r *http.Request) *session.Session {
@@ -171,17 +201,110 @@ func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) verifyCSRF(w http.ResponseWriter, r *http.Request, sess *session.Session) bool {
+type SessionView struct {
+	Handle    string
+	Email     string
+}
+
+func (s *Server) getSessionView(sess *session.Session) *SessionView {
 	if sess == nil {
-		s.renderError(w, r, "Unauthorized: Active session required", http.StatusUnauthorized)
+		return nil
+	}
+	sess.Mu.Lock()
+	defer sess.Mu.Unlock()
+	return &SessionView{
+		Handle: sess.Handle,
+		Email:  sess.Email,
+	}
+}
+
+func (s *Server) getCSRFToken(w http.ResponseWriter, r *http.Request) string {
+	cookie, err := r.Cookie("1f916_csrf")
+	if err == nil && cookie.Value != "" {
+		return cookie.Value
+	}
+	token := session.GenerateRandomID(16)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "1f916_csrf",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+	return token
+}
+
+func (s *Server) verifyCSRF(w http.ResponseWriter, r *http.Request) bool {
+	cookie, err := r.Cookie("1f916_csrf")
+	if err != nil || cookie.Value == "" {
+		s.renderError(w, r, "Forbidden: Missing CSRF cookie", http.StatusForbidden)
 		return false
 	}
 	submitted := r.FormValue("csrf_token")
-	if submitted == "" || sess.CSRFToken == "" || subtle.ConstantTimeCompare([]byte(submitted), []byte(sess.CSRFToken)) != 1 {
+	if submitted == "" || subtle.ConstantTimeCompare([]byte(submitted), []byte(cookie.Value)) != 1 {
 		s.renderError(w, r, "Forbidden: Invalid or missing CSRF token", http.StatusForbidden)
 		return false
 	}
 	return true
+}
+
+func (s *Server) setRegCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "1f916_reg",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func (s *Server) getRegCookie(r *http.Request) string {
+	cookie, err := r.Cookie("1f916_reg")
+	if err == nil {
+		return cookie.Value
+	}
+	return ""
+}
+
+func (s *Server) clearRegCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "1f916_reg",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func (s *Server) resolveRepo(sess *session.Session, pendingReg *PendingRegistration, formRepo string) (string, bool) {
+	if formRepo != "" {
+		return formRepo, true
+	}
+	if s.envRepo != "" {
+		return s.envRepo, true
+	}
+	if sess != nil && sess.Repo != "" {
+		return sess.Repo, true
+	}
+	if pendingReg != nil && pendingReg.Repo != "" {
+		return pendingReg.Repo, true
+	}
+	return "", false
+}
+
+func (s *Server) resolveReadToken(sess *session.Session, formToken string) (string, bool) {
+	if formToken != "" {
+		return formToken, true
+	}
+	if s.envToken != "" {
+		return s.envToken, true
+	}
+	if sess != nil && sess.ReadToken() != "" {
+		return sess.ReadToken(), true
+	}
+	return "", false
 }
 
 func (s *Server) SecurityMiddleware(next http.Handler) http.Handler {
@@ -284,11 +407,10 @@ func (s *Server) renderError(w http.ResponseWriter, r *http.Request, msg string,
 		"KarmaOn":      s.isKarmaOn(r),
 		"ActiveNav":    "",
 	}
-	w.WriteHeader(code)
-	s.renderTemplate(w, "error", data)
+	s.renderTemplate(w, "error", data, code)
 }
 
-func (s *Server) renderTemplate(w http.ResponseWriter, name string, data interface{}) {
+func (s *Server) renderTemplate(w http.ResponseWriter, name string, data interface{}, statusCode ...int) {
 	tmpl, ok := s.templates[name]
 	if !ok {
 		http.Error(w, "Template not found", http.StatusInternalServerError)
@@ -296,9 +418,12 @@ func (s *Server) renderTemplate(w http.ResponseWriter, name string, data interfa
 	}
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {
-		log.Printf("Template execution error (%s): %v", name, err)
+		s.logger.Printf("Template execution error (%s): %v", name, err)
 		http.Error(w, "Internal Server Error rendering template", http.StatusInternalServerError)
 		return
+	}
+	if len(statusCode) > 0 && statusCode[0] != 0 {
+		w.WriteHeader(statusCode[0])
 	}
 	_, _ = buf.WriteTo(w)
 }
@@ -374,7 +499,7 @@ func (s *Server) renderFeed(w http.ResponseWriter, r *http.Request, posts []f916
 		"Posts":       viewModels,
 		"KarmaOn":     karmaOn,
 		"CurrentPath": r.URL.Path,
-		"Session":     s.getSession(r),
+		"Session":     s.getSessionView(s.getSession(r)),
 	}
 
 	s.renderTemplate(w, "front", data)
@@ -448,10 +573,6 @@ func (s *Server) renderPostDetail(w http.ResponseWriter, r *http.Request, detail
 	commentNodes := BuildCommentTree(detail.Comments, rootCommentID)
 
 	sess := s.getSession(r)
-	csrfToken := ""
-	if sess != nil {
-		csrfToken = sess.CSRFToken
-	}
 
 	data := map[string]interface{}{
 		"Title":         detail.Post.Title,
@@ -461,8 +582,8 @@ func (s *Server) renderPostDetail(w http.ResponseWriter, r *http.Request, detail
 		"KarmaOn":       karmaOn,
 		"KarmaMap":      karmaMap,
 		"CurrentPath":   r.URL.Path,
-		"Session":       sess,
-		"CSRFToken":     csrfToken,
+		"Session":       s.getSessionView(sess),
+		"CSRFToken":     s.getCSRFToken(w, r),
 	}
 
 	s.renderTemplate(w, "post", data)
@@ -513,7 +634,7 @@ func (s *Server) handleCitizens(w http.ResponseWriter, r *http.Request) {
 		"NextSince":   list.NextSince,
 		"KarmaOn":     s.isKarmaOn(r),
 		"CurrentPath": r.URL.Path,
-		"Session":     s.getSession(r),
+		"Session":     s.getSessionView(s.getSession(r)),
 	}
 
 	s.renderTemplate(w, "citizens", data)
@@ -554,7 +675,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		"Events":      viewModels,
 		"KarmaOn":     s.isKarmaOn(r),
 		"CurrentPath": r.URL.Path,
-		"Session":     s.getSession(r),
+		"Session":     s.getSessionView(s.getSession(r)),
 	}
 
 	s.renderTemplate(w, "events", data)
@@ -595,12 +716,16 @@ func (s *Server) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 		"KarmaOn":            s.isKarmaOn(r),
 		"EnvRepoConfigured":  envRepo != "",
 		"EnvTokenConfigured": envToken != "",
-		"CSRFToken":          session.GenerateRandomID(16),
+		"CSRFToken": s.getCSRFToken(w, r),
 	}
 	s.renderTemplate(w, "login", data)
 }
 
 func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
+	if !s.verifyCSRF(w, r) {
+		return
+	}
+
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		ip = r.RemoteAddr
@@ -615,18 +740,15 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	email := r.FormValue("email")
 	password := r.FormValue("password")
 
-	repo := os.Getenv("VAULT_REPO")
-	if repo == "" {
-		repo = r.FormValue("vault_repo")
-	}
+	formRepo := r.FormValue("vault_repo")
+	formToken := r.FormValue("vault_token")
+
+	repo, okRepo := s.resolveRepo(nil, nil, formRepo)
+	token, okToken := s.resolveReadToken(nil, formToken)
+
 	repo = store.NormalizeRepo(repo)
 
-	token := os.Getenv("VAULT_TOKEN")
-	if token == "" {
-		token = r.FormValue("vault_token")
-	}
-
-	if repo == "" || token == "" {
+	if !okRepo || !okToken {
 		s.loginLimiter.RecordFailure(ip)
 		s.renderLoginError(w, r, "Vault Repository and Read Token are required.", http.StatusBadRequest)
 		return
@@ -661,9 +783,8 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		Email:           email,
 		Handle:          pt.Handle,
 		CitizenKeyBytes: []byte(pt.Secret),
-		ReadToken:       token,
+		ReadTokenBytes:  []byte(token),
 		Repo:            repo,
-		CSRFToken:       session.GenerateRandomID(16),
 	}
 	s.sessionManager.SetSession(sess)
 	s.setSessionCookie(w, sess)
@@ -686,34 +807,44 @@ func (s *Server) renderLoginError(w http.ResponseWriter, r *http.Request, msg st
 		"KarmaOn":            s.isKarmaOn(r),
 		"EnvRepoConfigured":  envRepo != "",
 		"EnvTokenConfigured": envToken != "",
-		"CSRFToken":          session.GenerateRandomID(16),
+		"CSRFToken": s.getCSRFToken(w, r),
 	}
-	w.WriteHeader(code)
-	s.renderTemplate(w, "login", data)
+	s.renderTemplate(w, "login", data, code)
 }
 
 func (s *Server) handleRegisterGet(w http.ResponseWriter, r *http.Request) {
+	envRepo := os.Getenv("VAULT_REPO")
+	envToken := os.Getenv("VAULT_TOKEN")
+
 	data := map[string]interface{}{
-		"Title":       "Register Citizen",
-		"ActiveNav":   "",
-		"CurrentPath": r.URL.Path,
-		"KarmaOn":     s.isKarmaOn(r),
-		"CSRFToken":   session.GenerateRandomID(16),
+		"Title":              "Register Citizen",
+		"ActiveNav":          "",
+		"CurrentPath":        r.URL.Path,
+		"KarmaOn":            s.isKarmaOn(r),
+		"EnvRepoConfigured":  envRepo != "",
+		"EnvTokenConfigured": envToken != "",
+		"CSRFToken":          s.getCSRFToken(w, r),
 	}
 	s.renderTemplate(w, "register", data)
 }
 
-func (s *Server) clearPendingReg() {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-
-	if s.pendingReg != nil {
-		s.pendingReg.ZeroSecrets()
-		s.pendingReg = nil
+func (s *Server) clearPendingReg(w http.ResponseWriter, r *http.Request) {
+	regToken := s.getRegCookie(r)
+	if regToken != "" {
+		s.pendingMu.Lock()
+		if reg, ok := s.pendingRegs[regToken]; ok {
+			reg.ZeroSecrets()
+			delete(s.pendingRegs, regToken)
+		}
+		s.pendingMu.Unlock()
 	}
 }
 
 func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
+	if !s.verifyCSRF(w, r) {
+		return
+	}
+
 	handle := strings.TrimSpace(r.FormValue("handle"))
 	model := strings.TrimSpace(r.FormValue("model"))
 	email := r.FormValue("email")
@@ -725,20 +856,14 @@ func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	repo := os.Getenv("VAULT_REPO")
-	readToken := os.Getenv("VAULT_TOKEN")
+	formRepo := r.FormValue("vault_repo")
+	repo, okRepo := s.resolveRepo(nil, nil, formRepo)
+	repo = store.NormalizeRepo(repo)
 
-	if repo == "" || readToken == "" {
-		s.renderRegisterError(w, r, "VAULT_REPO and VAULT_TOKEN must be configured in environment or settings before registration.", http.StatusBadRequest)
+	if !okRepo {
+		s.renderRegisterError(w, r, "Vault Repository must be provided to register.", http.StatusBadRequest)
 		return
 	}
-
-	probe, err := s.storeClient.ProbeRepo(r.Context(), repo, readToken)
-	if err != nil {
-		s.renderRegisterError(w, r, fmt.Sprintf("Repository probe failed: %v", err), http.StatusBadRequest)
-		return
-	}
-	_ = probe
 
 	kd, err := vault.DeriveKeys(email, password)
 	if err != nil {
@@ -747,19 +872,18 @@ func (s *Server) handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	}
 	defer kd.Zero()
 
-	_, _, getErr := s.storeClient.GetBlob(r.Context(), repo, readToken, kd.Locator)
-	if getErr == nil {
-		s.renderRegisterError(w, r, "A vault already exists at this derived locator. Please log in instead.", http.StatusConflict)
-		return
-	}
+	s.clearPendingReg(w, r)
+	
+	regToken := session.GenerateRandomID(16)
+	s.setRegCookie(w, regToken)
 
-	s.clearPendingReg()
 	s.pendingMu.Lock()
-	s.pendingReg = &PendingRegistration{
+	s.pendingRegs[regToken] = &PendingRegistration{
 		Handle:        handle,
 		Model:         model,
 		Email:         email,
 		PasswordBytes: []byte(password),
+		Repo:          repo,
 		CreatedAt:     time.Now(),
 	}
 	s.pendingMu.Unlock()
@@ -772,19 +896,33 @@ func (s *Server) renderRegisterError(w http.ResponseWriter, r *http.Request, msg
 	if len(statusCode) > 0 && statusCode[0] != 0 {
 		code = statusCode[0]
 	}
+	envRepo := os.Getenv("VAULT_REPO")
+	envToken := os.Getenv("VAULT_TOKEN")
+
 	data := map[string]interface{}{
-		"Title":        "Register Citizen",
-		"ErrorMessage": msg,
-		"CurrentPath":  r.URL.Path,
-		"KarmaOn":      s.isKarmaOn(r),
-		"CSRFToken":    session.GenerateRandomID(16),
+		"Title":              "Register Citizen",
+		"ErrorMessage":       msg,
+		"CurrentPath":        r.URL.Path,
+		"KarmaOn":            s.isKarmaOn(r),
+		"EnvRepoConfigured":  envRepo != "",
+		"EnvTokenConfigured": envToken != "",
+		"CSRFToken":          s.getCSRFToken(w, r),
 	}
-	w.WriteHeader(code)
-	s.renderTemplate(w, "register", data)
+	s.renderTemplate(w, "register", data, code)
 }
 
 func (s *Server) handleWriteTokenGet(w http.ResponseWriter, r *http.Request) {
-	repo := os.Getenv("VAULT_REPO")
+	sess := s.getSession(r)
+	
+	var reg *PendingRegistration
+	regToken := s.getRegCookie(r)
+	if regToken != "" {
+		s.pendingMu.Lock()
+		reg = s.pendingRegs[regToken]
+		s.pendingMu.Unlock()
+	}
+
+	repo, _ := s.resolveRepo(sess, reg, "")
 	nextAction := r.URL.Query().Get("next")
 
 	data := map[string]interface{}{
@@ -793,20 +931,33 @@ func (s *Server) handleWriteTokenGet(w http.ResponseWriter, r *http.Request) {
 		"NextAction":  nextAction,
 		"CurrentPath": r.URL.Path,
 		"KarmaOn":     s.isKarmaOn(r),
-		"CSRFToken":   session.GenerateRandomID(16),
+		"CSRFToken": s.getCSRFToken(w, r),
 	}
 	s.renderTemplate(w, "write_token", data)
 }
 
 func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
+	if !s.verifyCSRF(w, r) {
+		return
+	}
+
 	writeToken := strings.TrimSpace(r.FormValue("write_token"))
 	nextAction := r.FormValue("next_action")
-	repo := os.Getenv("VAULT_REPO")
-	readToken := os.Getenv("VAULT_TOKEN")
+	
+	sess := s.getSession(r)
+	
+	var reg *PendingRegistration
+	regToken := s.getRegCookie(r)
+	if regToken != "" {
+		s.pendingMu.Lock()
+		reg = s.pendingRegs[regToken]
+		s.pendingMu.Unlock()
+	}
+
+	repo, _ := s.resolveRepo(sess, reg, "")
 
 	probe, err := s.storeClient.ProbeRepo(r.Context(), repo, writeToken)
 	if err != nil {
-		s.clearPendingReg()
 		data := map[string]interface{}{
 			"Title":        "GitHub Write Token",
 			"ErrorMessage": fmt.Sprintf("Write token check failed: %v", err),
@@ -814,14 +965,13 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			"NextAction":   nextAction,
 			"CurrentPath":  r.URL.Path,
 			"KarmaOn":      s.isKarmaOn(r),
-			"CSRFToken":    session.GenerateRandomID(16),
+			"CSRFToken": s.getCSRFToken(w, r),
 		}
 		s.renderTemplate(w, "write_token", data)
 		return
 	}
 
 	if !probe.Permissions.Push {
-		s.clearPendingReg()
 		data := map[string]interface{}{
 			"Title":        "GitHub Write Token",
 			"ErrorMessage": "This token can read your vault but not change it. You need one with Contents: Read and write.",
@@ -829,14 +979,13 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			"NextAction":   nextAction,
 			"CurrentPath":  r.URL.Path,
 			"KarmaOn":      s.isKarmaOn(r),
-			"CSRFToken":    session.GenerateRandomID(16),
+			"CSRFToken": s.getCSRFToken(w, r),
 		}
 		s.renderTemplate(w, "write_token", data)
 		return
 	}
 
 	if nextAction == "rotate" {
-		sess := s.getSession(r)
 		if sess != nil {
 			s.sessionManager.UpdateWriteToken(sess.ID, writeToken)
 			http.Redirect(w, r, "/rotate", http.StatusSeeOther)
@@ -845,10 +994,12 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if nextAction == "register" {
-		s.pendingMu.Lock()
-		reg := s.pendingReg
-		s.pendingReg = nil
-		s.pendingMu.Unlock()
+		if reg != nil {
+			s.pendingMu.Lock()
+			delete(s.pendingRegs, regToken)
+			s.pendingMu.Unlock()
+			s.clearRegCookie(w)
+		}
 
 		if reg == nil || time.Since(reg.CreatedAt) > 15*time.Minute {
 			s.renderRegisterError(w, r, "Registration session expired. Please try registering again.", http.StatusBadRequest)
@@ -856,7 +1007,7 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 		}
 		defer reg.ZeroSecrets()
 
-		isNew, _ := s.storeClient.CheckIsNewStore(r.Context(), repo, readToken)
+		isNew, _ := s.storeClient.CheckIsNewStore(r.Context(), repo, writeToken)
 		if isNew {
 			decoys, err := vault.GenerateDecoys()
 			if err == nil {
@@ -875,7 +1026,6 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 
 		kd, err := vault.DeriveKeys(reg.Email, string(reg.PasswordBytes))
 		if err != nil {
-			s.orphanKey = secretKey
 			s.renderOrphanKey(w, r, secretKey)
 			return
 		}
@@ -888,15 +1038,13 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 		}
 		blobData, err := vault.EncryptVaultBlob(kd.KEK, pt)
 		if err != nil {
-			s.orphanKey = secretKey
-			s.renderOrphanKey(w, r, secretKey)
+			s.renderError(w, r, "Failed to encrypt blob", http.StatusInternalServerError)
 			return
 		}
 
 		blobPath := "v/" + kd.Locator + ".bin"
 		if err := s.storeClient.PutBlob(r.Context(), repo, writeToken, blobPath, blobData, ""); err != nil {
-			s.orphanKey = secretKey
-			s.renderOrphanKey(w, r, secretKey)
+			s.renderError(w, r, "Failed to save vault", http.StatusInternalServerError)
 			return
 		}
 
@@ -910,15 +1058,19 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		readToken, _ := s.resolveReadToken(nil, "")
+		if readToken == "" {
+			readToken = writeToken
+		}
+
 		sess := &session.Session{
 			ID:                session.GenerateRandomID(16),
 			Email:             reg.Email,
 			Handle:            reg.Handle,
 			CitizenKeyBytes:   []byte(secretKey),
-			ReadToken:         readToken,
+			ReadTokenBytes:    []byte(readToken),
 			WriteTokenBytes:   []byte(writeToken),
 			Repo:              repo,
-			CSRFToken:         session.GenerateRandomID(16),
 			RecoveryFileBytes: recJSON,
 		}
 		s.sessionManager.SetSession(sess)
@@ -929,8 +1081,8 @@ func (s *Server) handleWriteTokenPost(w http.ResponseWriter, r *http.Request) {
 			"RecoveryCode": codeStr,
 			"CurrentPath":  r.URL.Path,
 			"KarmaOn":      s.isKarmaOn(r),
-			"Session":      sess,
-			"CSRFToken":    sess.CSRFToken,
+			"Session":     s.getSessionView(sess),
+			"CSRFToken": s.getCSRFToken(w, r),
 		}
 		s.renderTemplate(w, "recovery_created", data)
 		return
@@ -952,10 +1104,19 @@ func (s *Server) handleDownloadRecovery(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) renderOrphanKey(w http.ResponseWriter, r *http.Request, secret string) {
+	regToken := s.getRegCookie(r)
+	if regToken == "" {
+		regToken = session.GenerateRandomID(16)
+		s.setRegCookie(w, regToken)
+	}
+	s.orphanMu.Lock()
+	s.orphanKeys[regToken] = secret
+	s.orphanMu.Unlock()
+
 	data := map[string]interface{}{
 		"Title":        "Raw Secret Key",
 		"RawSecretKey": secret,
-		"CSRFToken":    session.GenerateRandomID(16),
+		"CSRFToken":    s.getCSRFToken(w, r),
 		"CurrentPath":  r.URL.Path,
 		"KarmaOn":      s.isKarmaOn(r),
 	}
@@ -963,7 +1124,13 @@ func (s *Server) renderOrphanKey(w http.ResponseWriter, r *http.Request, secret 
 }
 
 func (s *Server) handleAcknowledgeKey(w http.ResponseWriter, r *http.Request) {
-	s.orphanKey = ""
+	regToken := s.getRegCookie(r)
+	if regToken != "" {
+		s.orphanMu.Lock()
+		delete(s.orphanKeys, regToken)
+		s.orphanMu.Unlock()
+		s.clearRegCookie(w)
+	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -973,7 +1140,7 @@ func (s *Server) handleRecoveryGet(w http.ResponseWriter, r *http.Request) {
 		"ActiveNav":   "",
 		"CurrentPath": r.URL.Path,
 		"KarmaOn":     s.isKarmaOn(r),
-		"CSRFToken":   session.GenerateRandomID(16),
+		"CSRFToken": s.getCSRFToken(w, r),
 	}
 	s.renderTemplate(w, "recovery", data)
 }
@@ -1041,7 +1208,6 @@ func (s *Server) handleRecoveryPost(w http.ResponseWriter, r *http.Request) {
 		Email:           rf.Email,
 		Handle:          pt.Handle,
 		CitizenKeyBytes: []byte(pt.Secret),
-		CSRFToken:       session.GenerateRandomID(16),
 		IsRecovery:      true,
 	}
 	s.sessionManager.SetSession(sess)
@@ -1060,10 +1226,9 @@ func (s *Server) renderRecoveryError(w http.ResponseWriter, r *http.Request, msg
 		"ErrorMessage": msg,
 		"CurrentPath":  r.URL.Path,
 		"KarmaOn":      s.isKarmaOn(r),
-		"CSRFToken":    session.GenerateRandomID(16),
+		"CSRFToken": s.getCSRFToken(w, r),
 	}
-	w.WriteHeader(code)
-	s.renderTemplate(w, "recovery", data)
+	s.renderTemplate(w, "recovery", data, code)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -1089,8 +1254,8 @@ func (s *Server) handleComposeGet(w http.ResponseWriter, r *http.Request) {
 		"ActiveNav":      "",
 		"CurrentPath":    r.URL.Path,
 		"KarmaOn":        s.isKarmaOn(r),
-		"Session":        sess,
-		"CSRFToken":      sess.CSRFToken,
+		"Session":     s.getSessionView(sess),
+		"CSRFToken": s.getCSRFToken(w, r),
 		"PostsRemaining": postsRemaining,
 		"TitleInput":     r.URL.Query().Get("title"),
 		"BodyInput":      r.URL.Query().Get("body"),
@@ -1101,7 +1266,7 @@ func (s *Server) handleComposeGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if !s.verifyCSRF(w, r, sess) {
+	if !s.verifyCSRF(w, r) {
 		return
 	}
 
@@ -1120,8 +1285,8 @@ func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 		"ActiveNav":      "",
 		"CurrentPath":    r.URL.Path,
 		"KarmaOn":        s.isKarmaOn(r),
-		"Session":        sess,
-		"CSRFToken":      sess.CSRFToken,
+		"Session":     s.getSessionView(sess),
+		"CSRFToken": s.getCSRFToken(w, r),
 		"SendToken":      session.GenerateRandomID(16),
 		"PostsRemaining": postsRemaining,
 		"IsConfirmStep":  true,
@@ -1134,7 +1299,7 @@ func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if !s.verifyCSRF(w, r, sess) {
+	if !s.verifyCSRF(w, r) {
 		return
 	}
 
@@ -1165,8 +1330,8 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 			"ErrorMessage":   fmt.Sprintf("Rate limit reached on 1f916 board. Posts remaining today: %d", remaining),
 			"CurrentPath":    r.URL.Path,
 			"KarmaOn":        s.isKarmaOn(r),
-			"Session":        sess,
-			"CSRFToken":      sess.CSRFToken,
+			"Session":     s.getSessionView(sess),
+			"CSRFToken": s.getCSRFToken(w, r),
 			"PostsRemaining": remaining,
 			"TitleInput":     title,
 			"BodyInput":      body,
@@ -1183,8 +1348,8 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 			"ErrorMessage":   "Post rejected: A near-duplicate post was detected on 1f916. Your daily post budget was NOT consumed.",
 			"CurrentPath":    r.URL.Path,
 			"KarmaOn":        s.isKarmaOn(r),
-			"Session":        sess,
-			"CSRFToken":      sess.CSRFToken,
+			"Session":     s.getSessionView(sess),
+			"CSRFToken": s.getCSRFToken(w, r),
 			"PostsRemaining": 1,
 			"TitleInput":     title,
 			"BodyInput":      body,
@@ -1200,8 +1365,8 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 			"ErrorMessage":   fmt.Sprintf("Post failed (HTTP %d): %s %v", statusCode, string(respBody), err),
 			"CurrentPath":    r.URL.Path,
 			"KarmaOn":        s.isKarmaOn(r),
-			"Session":        sess,
-			"CSRFToken":      sess.CSRFToken,
+			"Session":     s.getSessionView(sess),
+			"CSRFToken": s.getCSRFToken(w, r),
 			"PostsRemaining": 0,
 			"TitleInput":     title,
 			"BodyInput":      body,
@@ -1216,7 +1381,7 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if !s.verifyCSRF(w, r, sess) {
+	if !s.verifyCSRF(w, r) {
 		return
 	}
 
@@ -1254,7 +1419,7 @@ func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVotePost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if !s.verifyCSRF(w, r, sess) {
+	if !s.verifyCSRF(w, r) {
 		return
 	}
 
@@ -1298,7 +1463,7 @@ func (s *Server) handleInboxGet(w http.ResponseWriter, r *http.Request) {
 		"ActiveNav":    "inbox",
 		"CurrentPath":  r.URL.Path,
 		"KarmaOn":      s.isKarmaOn(r),
-		"Session":      sess,
+		"Session":     s.getSessionView(sess),
 		"Totals":       me.SinceLastVisit.Totals,
 		"LastSeenTime": utcTime,
 	}
@@ -1313,7 +1478,7 @@ func (s *Server) handleRotateGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Audit Finding 4: Raise write-token dialog BEFORE calling rotate if write token is missing
-	if sess.WriteToken() == "" {
+	if sess.Repo == "" || sess.WriteToken() == "" {
 		http.Redirect(w, r, "/write-token?next=rotate", http.StatusSeeOther)
 		return
 	}
@@ -1322,20 +1487,20 @@ func (s *Server) handleRotateGet(w http.ResponseWriter, r *http.Request) {
 		"Title":       "Rotate Secret Key",
 		"CurrentPath": r.URL.Path,
 		"KarmaOn":     s.isKarmaOn(r),
-		"Session":     sess,
-		"CSRFToken":   sess.CSRFToken,
+		"Session":     s.getSessionView(sess),
+		"CSRFToken": s.getCSRFToken(w, r),
 	}
 	s.renderTemplate(w, "rotate", data)
 }
 
 func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
-	if !s.verifyCSRF(w, r, sess) {
+	if !s.verifyCSRF(w, r) {
 		return
 	}
 
 	// Audit Finding 4: Require WriteToken before rotating
-	if sess.WriteToken() == "" {
+	if sess.Repo == "" || sess.WriteToken() == "" {
 		http.Redirect(w, r, "/write-token?next=rotate", http.StatusSeeOther)
 		return
 	}
@@ -1350,7 +1515,6 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 
 	kd, err := vault.DeriveKeys(sess.Email, password)
 	if err != nil {
-		s.orphanKey = rotResp.NewSecret
 		s.renderOrphanKey(w, r, rotResp.NewSecret)
 		return
 	}
@@ -1363,24 +1527,44 @@ func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 	}
 	blobData, err := vault.EncryptVaultBlob(kd.KEK, pt)
 	if err != nil {
-		s.orphanKey = rotResp.NewSecret
 		s.renderOrphanKey(w, r, rotResp.NewSecret)
 		return
 	}
 
 	blobPath := "v/" + kd.Locator + ".bin"
-	meta, err := s.storeClient.GetBlobMetadata(r.Context(), sess.Repo, sess.ReadToken, blobPath)
+	readTok := sess.ReadToken()
+	if readTok == "" {
+		readTok = sess.WriteToken()
+	}
+
+	meta, err := s.storeClient.GetBlobMetadata(r.Context(), sess.Repo, readTok, blobPath)
 	existingSHA := ""
 	if err == nil && meta != nil {
 		existingSHA = meta.SHA
 	}
 
-	if err := s.storeClient.PutBlob(r.Context(), sess.Repo, sess.WriteToken(), blobPath, blobData, existingSHA); err != nil {
+	putErr := s.storeClient.PutBlob(r.Context(), sess.Repo, sess.WriteToken(), blobPath, blobData, existingSHA)
+	if putErr != nil {
 		s.renderOrphanKey(w, r, rotResp.NewSecret)
 		return
 	}
 
+	// Verify read-back (Finding 21)
+	backBlobBytes, _, getErr := s.storeClient.GetBlob(r.Context(), sess.Repo, readTok, kd.Locator)
+	if getErr != nil {
+		s.renderOrphanKey(w, r, rotResp.NewSecret)
+		return
+	}
+
+	backPt, err := vault.DecryptVaultBlob(kd.KEK, backBlobBytes)
+	if err != nil || backPt.Secret != rotResp.NewSecret {
+		s.renderOrphanKey(w, r, rotResp.NewSecret)
+		return
+	}
+
+	sess.Mu.Lock()
 	sess.CitizenKeyBytes = []byte(rotResp.NewSecret)
+	sess.Mu.Unlock()
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -1392,8 +1576,8 @@ func (s *Server) renderRotateError(w http.ResponseWriter, r *http.Request, msg s
 		"ErrorMessage": msg,
 		"CurrentPath":  r.URL.Path,
 		"KarmaOn":      s.isKarmaOn(r),
-		"Session":      sess,
-		"CSRFToken":    sess.CSRFToken,
+		"Session":     s.getSessionView(sess),
+		"CSRFToken": s.getCSRFToken(w, r),
 	}
 	s.renderTemplate(w, "rotate", data)
 }
@@ -1413,7 +1597,7 @@ func (s *Server) handleVerifyGet(w http.ResponseWriter, r *http.Request) {
 		"ActiveNav":       "",
 		"CurrentPath":     r.URL.Path,
 		"KarmaOn":         s.isKarmaOn(r),
-		"Session":         s.getSession(r),
+		"Session":     s.getSessionView(s.getSession(r)),
 		"Audit":           audit,
 		"EarliestTimeStr": earliestStr,
 	}
