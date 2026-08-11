@@ -21,25 +21,135 @@ type Session struct {
 	IsRecovery        bool // Session opened via recovery file
 	RecoveryFileBytes []byte
 
+	// Pulse state for the unread badge in the shared layout.
+	hasUnread      bool
+	lastPulseCheck time.Time
+
+	// Flash notices: written by a write handler, read once by the page that
+	// renders next, and cleared only after that page rendered successfully.
+	notices []string
+
 	LastActive time.Time
 }
 
 func (s *Session) CitizenKey() string {
+	if s == nil {
+		return ""
+	}
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 	return string(s.CitizenKeyBytes)
 }
 
+// HasKey reports whether this session holds a citizen key. It is nil-safe so
+// every guard in the web package can read `if !sess.HasKey()` and nothing has
+// to carry the old `sess == nil || sess.CitizenKey() == ""` idiom.
+func (s *Session) HasKey() bool {
+	if s == nil {
+		return false
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	return len(s.CitizenKeyBytes) > 0
+}
+
 func (s *Session) WriteToken() string {
+	if s == nil {
+		return ""
+	}
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 	return string(s.WriteTokenBytes)
 }
 
 func (s *Session) ReadToken() string {
+	if s == nil {
+		return ""
+	}
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 	return string(s.ReadTokenBytes)
+}
+
+// BeginPulse reports whether the caller should fetch a fresh pulse, and claims
+// the fetch if so. LastPulseCheck is written BEFORE the lock is released, so
+// two simultaneous requests cannot both read a stale timestamp and both fetch.
+func (s *Session) BeginPulse(maxAge time.Duration) bool {
+	if s == nil {
+		return false
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	if !s.lastPulseCheck.IsZero() && time.Since(s.lastPulseCheck) < maxAge {
+		return false
+	}
+	s.lastPulseCheck = time.Now()
+	return true
+}
+
+// SetUnread records the answer of the last pulse.
+func (s *Session) SetUnread(unread bool) {
+	if s == nil {
+		return
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	s.hasUnread = unread
+}
+
+// HasUnread is what the badge in the shared layout renders.
+func (s *Session) HasUnread() bool {
+	if s == nil {
+		return false
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	return s.hasUnread
+}
+
+// LastPulseCheck is exposed for tests and diagnostics.
+func (s *Session) LastPulseCheck() time.Time {
+	if s == nil {
+		return time.Time{}
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	return s.lastPulseCheck
+}
+
+// SetNotices stores the flash notices from a write receipt.
+func (s *Session) SetNotices(lines []string) {
+	if s == nil {
+		return
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	s.notices = append([]string(nil), lines...)
+}
+
+// PeekNotices reads the flash notices WITHOUT clearing them. The page renders
+// into its buffer first; only a good buffer earns a ClearNotices.
+func (s *Session) PeekNotices() []string {
+	if s == nil {
+		return nil
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	if len(s.notices) == 0 {
+		return nil
+	}
+	return append([]string(nil), s.notices...)
+}
+
+// ClearNotices drops the flash notices. Called only after the page they were
+// rendered into was written out.
+func (s *Session) ClearNotices() {
+	if s == nil {
+		return
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	s.notices = nil
 }
 
 func (s *Session) zeroLocked() {
@@ -59,6 +169,7 @@ func (s *Session) zeroLocked() {
 		vault.ZeroBytes(s.RecoveryFileBytes)
 		s.RecoveryFileBytes = nil
 	}
+	s.notices = nil
 }
 
 func (s *Session) ZeroSecrets() {
