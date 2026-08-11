@@ -282,14 +282,14 @@ func (s *Server) resolveRepo(sess *session.Session, pendingReg *PendingRegistrat
 	if formRepo != "" {
 		return formRepo, true
 	}
-	if s.envRepo != "" {
-		return s.envRepo, true
-	}
 	if sess != nil && sess.Repo != "" {
 		return sess.Repo, true
 	}
 	if pendingReg != nil && pendingReg.Repo != "" {
 		return pendingReg.Repo, true
+	}
+	if s.envRepo != "" {
+		return s.envRepo, true
 	}
 	return "", false
 }
@@ -298,11 +298,11 @@ func (s *Server) resolveReadToken(sess *session.Session, formToken string) (stri
 	if formToken != "" {
 		return formToken, true
 	}
-	if s.envToken != "" {
-		return s.envToken, true
-	}
 	if sess != nil && sess.ReadToken() != "" {
 		return sess.ReadToken(), true
+	}
+	if s.envToken != "" {
+		return s.envToken, true
 	}
 	return "", false
 }
@@ -1266,6 +1266,10 @@ func (s *Server) handleComposeGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey() == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
 	if !s.verifyCSRF(w, r) {
 		return
 	}
@@ -1299,6 +1303,10 @@ func (s *Server) handleComposePreview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey() == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
 	if !s.verifyCSRF(w, r) {
 		return
 	}
@@ -1381,6 +1389,10 @@ func (s *Server) handleComposePublish(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey() == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
 	if !s.verifyCSRF(w, r) {
 		return
 	}
@@ -1419,6 +1431,10 @@ func (s *Server) handleCommentPost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVotePost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey() == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
 	if !s.verifyCSRF(w, r) {
 		return
 	}
@@ -1495,6 +1511,10 @@ func (s *Server) handleRotateGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRotatePost(w http.ResponseWriter, r *http.Request) {
 	sess := s.getSession(r)
+	if sess == nil || sess.CitizenKey() == "" {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
 	if !s.verifyCSRF(w, r) {
 		return
 	}
