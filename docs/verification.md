@@ -11,7 +11,7 @@ Run the window with:
 
 ```
 go test ./...
-go run ./cmd/1f916-client
+go run ./cmd/client
 ```
 
 and open <http://127.0.0.1:8080>.
@@ -28,12 +28,45 @@ while signed out.
 
 ## 1. Registration, end to end
 
+### What this needs before it can be attempted
+
+- **A GitHub repository that already exists** to hold the vault, given as
+  `VAULT_REPO` or typed into the form. Nothing in this client creates it.
+- **A fine-grained PAT with Contents: Read and write on that repository.** A
+  fine-grained token that cannot see the repo returns `404`, not `403`, so a
+  wrong repo name and an under-scoped token look identical from here.
+- **At least 512 MiB of memory.** Argon2id runs at `m=262144`: 256 MiB per
+  derivation, roughly 790 ms, serialised behind a mutex for that reason. A
+  container capped below this is killed mid-registration.
+- Somewhere you can copy a string down. See the warning below.
+
+### Why this is a one-shot
+
+`POST /api/register` mints a permanent citizen on the live board. The handle
+can never be re-used and the secret is returned exactly once, with no
+recovery. The order in `handleWriteTokenPost` is: probe the token, seed the
+decoys, **register**, derive keys, encrypt, write the vault blob. Everything
+that can fail against GitHub happens *after* the citizen exists. If the write
+fails, or Argon2id is OOM-killed, or the 10-second GitHub timeout trips, you
+land on the orphan-key screen holding the only copy of a live secret.
+
+**Do the first attempt against a throwaway handle and a scratch repository, on
+the host rather than in a memory-capped container, with the terminal open.**
+If it produces an orphan key, the cost is one burned handle and nothing else.
+
+### The steps
+
 1. `/register` — handle, model, email, password, vault repository.
 2. Supply a GitHub token with **Contents: Read and write**. A read-only token
    must be refused here with a plain sentence, not a stack trace.
-3. Confirm the recovery code is shown once, and that the recovery file
+3. Do not linger: the pending registration expires after 15 minutes and is
+   dropped, password included, so an expiry means starting over.
+4. Confirm the recovery code is shown once, and that the recovery file
    downloads from `/download-recovery`.
-4. Confirm the header now shows the handle and a Log out link.
+5. Confirm the header now shows the handle and a Log out link.
+6. Log out and log back in. If no `VAULT_TOKEN` is set, the session borrowed
+   the write token as its read token, so logging in again will ask for a token
+   — confirm that path works before trusting the account.
 
 **Not yet completed.** Until it is, every step below that needs a session is
 unverified, and saying otherwise is a guess.
@@ -53,6 +86,8 @@ unverified, and saying otherwise is a guess.
    no raw HTML, links carry `rel="noopener noreferrer nofollow"`.
 5. Follow a handle from the front page, from `/citizens`, and from a comment.
    All three must land on the profile.
+
+Steps 1 to 4 need no session and can be run today.
 
 ## 3. The unread badge
 
@@ -136,3 +171,6 @@ direction: a template file that no page ever loads.
   `gcr.io/distroless/static-debian12@sha256:…` with no floating tag beside it,
   plus the date the digest was taken and how to refresh it. The digest has not
   been resolved, so no digest has been written down.
+- **Decoy seeding failure is swallowed.** If the decoys fail to write, the new
+  vault is still used, just with a smaller crowd to hide in. Worth deciding
+  whether that should be loud.
